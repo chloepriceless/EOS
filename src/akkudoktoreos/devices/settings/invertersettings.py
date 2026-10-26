@@ -122,6 +122,24 @@ class InverterCommonSettings(DevicesBaseSettings):
             "x-scope": [str(ConfigScope.GENETIC)],
         },
     )
+    max_grid_import_power_w: Optional[float] = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        json_schema_extra={
+            "description": (
+                "Maximum power drawn from the grid [W] (peak shaving), e.g. the capacity "
+                "limit of a grid connection with interval metering. The optimizer reduces "
+                "AC charging first; the battery then covers load above the limit within "
+                "its discharge power, minimum SoC and max_power_w, also when the plan holds "
+                "it. Import above the limit that cannot be avoided is penalised with "
+                "optimization.genetic.penalties.grid_import_limit_excess. null means no "
+                "limit. Default null."
+            ),
+            "examples": [None, 8000],
+            "x-scope": [str(ConfigScope.GENETIC)],
+        },
+    )
     battery_id: Optional[str] = Field(
         default=None,
         json_schema_extra={
@@ -421,6 +439,7 @@ class InverterCommonSettings(DevicesBaseSettings):
             ),
             max_ac_charge_power_w=self.max_ac_charge_power_w,
             ac_charge_limits_total_charge=self.ac_charge_limits_total_charge,
+            max_grid_import_power_w=self.max_grid_import_power_w,
         )
 
     # ------------------------------------------------------------------

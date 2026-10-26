@@ -10,6 +10,12 @@ from pydantic import Field, computed_field
 
 from akkudoktoreos.config.configabc import SettingsBaseModel
 
+# Default of penalties["grid_import_limit_excess"]: EUR per kWh imported above
+# the inverter's max_grid_import_power_w. Far above any energy price, so the
+# optimizer avoids excess import wherever the battery can, but finite, so a
+# plan that cannot avoid it still ranks by how much it exceeds.
+GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH = 10.0
+
 
 def normalize_genetic_settings(value: Any) -> Any:
     """Preserve old feature settings in the current algorithm-specific namespace.
@@ -214,6 +220,7 @@ class GeneticCommonSettings(SettingsBaseModel):
             ev_soc_miss=10,
             ac_charge_break_even=1.0,
             battery_full_charge_miss=10,
+            grid_import_limit_excess=GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH,
         ),
         json_schema_extra={
             "description": "Penalty parameters used in fitness evaluation.",
