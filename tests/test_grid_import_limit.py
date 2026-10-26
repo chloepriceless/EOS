@@ -346,6 +346,7 @@ def _simulate(
     ev_charge: Optional[list[float]] = None,
     pv: Optional[list[float]] = None,
     dc: Optional[list[float]] = None,
+    price: Optional[list[float]] = None,
     limit_w: Optional[float] = LIMIT_W,
     **device_kwargs: Any,
 ) -> tuple[dict[str, Any], GeneticSimulation]:
@@ -374,7 +375,7 @@ def _simulate(
     sim.prepare(
         GeneticEnergyManagementParameters(
             pv_forecast_wh=pv or [0.0] * slots,
-            electricity_price_per_wh=[0.0003] * slots,
+            electricity_price_per_wh=price or [0.0003] * slots,
             feed_in_tariff_per_wh=0.00008,
             price_per_wh_battery=0.0,
             total_load=load,
@@ -620,6 +621,63 @@ class TestFitnessPenalty:
         fitness = _fitness(config_eos, result, sim.inverter)
 
         assert fitness == pytest.approx(result["Gesamtbilanz_Euro"] + 0.5725 * 10.0)
+
+
+    @staticmethod
+    def _fitness_with_break_even(
+        config_eos: ConfigEOS, result: dict[str, Any], sim: GeneticSimulation
+    ) -> float:
+        """Evaluate a real simulation result with the AC break-even penalty active."""
+        config_eos.optimization.genetic.penalties = {"ac_charge_break_even": 1.0}
+        optimizer = GeneticOptimization.__new__(GeneticOptimization)
+        optimizer.optimize_ev = False
+        optimizer.simulation = sim
+        optimizer._run_control_end_slot = len(result["Netzbezug_Wh_pro_Stunde"])
+
+        class _Individual(list):
+            pass
+
+        with patch.object(optimizer, "evaluate_inner", return_value=result):
+            fitness = optimizer.evaluate(
+                _Individual([0] * 2),
+                parameters=Mock(ems=Mock(price_per_wh_battery=0.0), ev=None),
+                start_hour=0,
+                worst_case=False,
+            )
+        return fitness[0]
+
+    def test_break_even_penalty_ignores_pv_kept_in_a_total_charge_setpoint(self, config_eos):
+        """Zero limit: the reported 0.2 is PV only, no grid charge to penalise."""
+        result, sim = _simulate(
+            config_eos,
+            load=[0.0, 1000.0],
+            ac=[0.5, 0.0],
+            soc_percentage=0,
+            total_charge=True,
+            pv=[1000.0, 0.0],
+            price=[0.0003, 0.0001],
+            limit_w=0.0,
+        )
+        assert sim.ac_charge_hours is not None
+        assert sim.ac_charge_hours[0] == pytest.approx(0.2)
+
+        fitness = self._fitness_with_break_even(config_eos, result, sim)
+
+        assert fitness == pytest.approx(result["Gesamtbilanz_Euro"])
+
+    def test_break_even_penalty_follows_the_grid_charge_drawn(self, config_eos):
+        """2 kWh drawn at 0.30 for a 0.10 future price: 2 kWh x 0.20 EUR/kWh."""
+        result, sim = _simulate(
+            config_eos,
+            load=[6000.0, 1000.0],
+            ac=[1.0, 0.0],
+            soc_percentage=0,
+            price=[0.0003, 0.0001],
+        )
+
+        fitness = self._fitness_with_break_even(config_eos, result, sim)
+
+        assert fitness == pytest.approx(result["Gesamtbilanz_Euro"] + 2000.0 * 0.0002)
 
 
 # ---------------------------------------------------------------------------

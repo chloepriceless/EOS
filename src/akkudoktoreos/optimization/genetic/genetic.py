@@ -623,6 +623,9 @@ class GeneticSimulation(PydanticBaseModel):
         soc_per_hour: Any
         soc_ev_per_hour: Any
         home_appliance_wh_per_hour: Any
+        # AC energy drawn from the grid in slots whose AC charge the grid
+        # import limit lowered, by slot index (see the break-even penalty).
+        grid_limited_ac_charge_wh: Optional[dict[int, float]] = None
 
         # Set initial state
         if battery_fast:
@@ -733,6 +736,8 @@ class GeneticSimulation(PydanticBaseModel):
         # limit, full battery).
         ac_charge_controls_fast = ac_charge_hours_fast
         max_grid_import_wh_fast = inverter_fast.max_grid_import_wh if inverter_fast else None
+        if max_grid_import_wh_fast is not None:
+            grid_limited_ac_charge_wh = {}
         ac_charge_hours_fast = _slot_values(ac_charge_hours_fast)
         ev_charge_hours_fast = _slot_values(ev_charge_hours_fast)
         if battery_fast:
@@ -882,6 +887,7 @@ class GeneticSimulation(PydanticBaseModel):
 
             # AC PV Battery Charge
             if ac_charge_factor > 0.0 and battery_fast:
+                grid_limited = False
                 if inverter_fast:
                     if max_grid_import_wh_fast is not None:
                         # With a grid import limit, the charge only fills what
@@ -891,6 +897,7 @@ class GeneticSimulation(PydanticBaseModel):
                             hour, ac_charge_factor, energy_consumption_grid_actual
                         )
                         if limited_factor < ac_charge_factor:
+                            grid_limited = True
                             ac_charge_controls_fast[hour] = limited_factor
                             if limited_factor <= 0.0 and dc_charge_hours_fast[hour] == 0:
                                 # The AC state let PV charge the battery in this
@@ -910,6 +917,8 @@ class GeneticSimulation(PydanticBaseModel):
                 consumption += ac_energy
                 energy_consumption_grid_actual += ac_energy
                 slot_losses += ac_charge_losses
+                if grid_limited and grid_limited_ac_charge_wh is not None:
+                    grid_limited_ac_charge_wh[hour_idx] = ac_energy
 
                 if ac_energy == 0.0 and battery_fast.soc_wh >= battery_fast.max_soc_wh:
                     # The full battery cannot take grid energy. Keep the DC and
@@ -978,7 +987,7 @@ class GeneticSimulation(PydanticBaseModel):
         total_revenue = np.nansum(revenue_per_hour)
 
         # Prepare output dictionary
-        return {
+        result = {
             "Last_Wh_pro_Stunde": loads_energy_per_hour,
             "Netzeinspeisung_Wh_pro_Stunde": feedin_energy_per_hour,
             "Netzbezug_Wh_pro_Stunde": consumption_energy_per_hour,
@@ -995,6 +1004,9 @@ class GeneticSimulation(PydanticBaseModel):
             "Electricity_price": electricity_price_per_hour,
             "Feed_in_tariff": feed_in_tariff_per_hour,
         }
+        if grid_limited_ac_charge_wh is not None:
+            result["grid_limited_ac_charge_wh"] = grid_limited_ac_charge_wh
+        return result
 
 
 class GeneticOptimization(OptimizationBase):
@@ -4084,6 +4096,7 @@ class GeneticOptimization(OptimizationBase):
                     best_prices = self._ac_break_even_prices(prices_arr, load_arr, free_ac_wh)
                     self._ac_break_even_best_prices = best_prices
 
+                grid_limited_ac_charge_wh = simulation_result.get("grid_limited_ac_charge_wh") or {}
                 for hour in range(start_hour, min(len(ac_charge_arr), n)):
                     ac_factor = ac_charge_arr[hour]
                     if ac_factor <= 0.0:
@@ -4110,8 +4123,14 @@ class GeneticOptimization(OptimizationBase):
                         # Penalty = excess cost per Wh × DC energy requested this slot.
                         # max_charge_power_w is a power [W]; the energy movable in
                         # one slot is power × slot_duration_h (¼ at 15 min).
-                        dc_wh = bat.max_charge_power_w * self.slot_duration_h * ac_factor
-                        ac_wh = dc_wh / max(inv.ac_to_dc_efficiency, 1e-9)
+                        if hour - start_hour in grid_limited_ac_charge_wh:
+                            # The grid import limit lowered this slot's charge;
+                            # its factor may even hold PV only (total-charge
+                            # setpoint). Use the energy drawn from the grid.
+                            ac_wh = grid_limited_ac_charge_wh[hour - start_hour]
+                        else:
+                            dc_wh = bat.max_charge_power_w * self.slot_duration_h * ac_factor
+                            ac_wh = dc_wh / max(inv.ac_to_dc_efficiency, 1e-9)
                         excess_cost_per_wh = break_even_price - best_uncovered_price
                         gesamtbilanz += ac_wh * excess_cost_per_wh * ac_penalty_factor
 
