@@ -272,18 +272,19 @@ class Inverter:
         if max_grid_import_wh is None or not battery or factor <= 0.0:
             return factor
         headroom_ac_wh = max_grid_import_wh - slot_grid_import_wh
-        if headroom_ac_wh <= 0.0:
-            return 0.0
         # The battery takes DC energy; the grid supplies it / ac_to_dc_efficiency.
-        headroom_dc_wh = headroom_ac_wh * self.ac_to_dc_efficiency
+        headroom_dc_wh = headroom_ac_wh * self.ac_to_dc_efficiency if headroom_ac_wh > 0.0 else 0.0
         budget_wh = battery.remaining_charge_budget_wh(hour)
-        if budget_wh * (1.0 if self.ac_charge_limits_total_charge else factor) <= headroom_dc_wh:
-            return factor
         if self.ac_charge_limits_total_charge:
-            # The grid fills what PV left of the slot cap (factor x rated power);
-            # lower the cap to PV charge plus headroom.
+            # The grid fills what PV left of the slot cap (factor x rated
+            # power). Lower the cap to the PV charge plus the headroom: the PV
+            # part of the setpoint stays, also without any headroom.
+            if budget_wh <= headroom_dc_wh:
+                return factor
             rated_wh = battery.max_charge_power_w * self.slot_duration_h
             return (rated_wh * factor - budget_wh + headroom_dc_wh) / rated_wh
+        if budget_wh * factor <= headroom_dc_wh:
+            return factor
         return headroom_dc_wh / budget_wh
 
     def charge_battery_from_grid(

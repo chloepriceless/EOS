@@ -345,6 +345,7 @@ def _simulate(
     discharge: Optional[list[float]] = None,
     ev_charge: Optional[list[float]] = None,
     pv: Optional[list[float]] = None,
+    dc: Optional[list[float]] = None,
     limit_w: Optional[float] = LIMIT_W,
     **device_kwargs: Any,
 ) -> tuple[dict[str, Any], GeneticSimulation]:
@@ -385,7 +386,7 @@ def _simulate(
     )
     sim.reset()
     sim.ac_charge_hours = np.array(ac or [0.0] * slots, dtype=float)
-    sim.dc_charge_hours = np.ones(slots)
+    sim.dc_charge_hours = np.array(dc or [1.0] * slots, dtype=float)
     sim.bat_discharge_hours = np.array(discharge or [0.0] * slots, dtype=float)
     if ev_charge is not None:
         sim.ev_charge_hours = np.array(ev_charge, dtype=float)
@@ -419,6 +420,8 @@ class TestGeneticSimulation:
         # 2000 Wh of the 5000 Wh charge budget: the reported factor is 0.4.
         assert sim.ac_charge_hours is not None
         assert sim.ac_charge_hours[0] == pytest.approx(0.4)
+        replay = self._replay(config_eos, sim, load=[6000.0, 1000.0], soc_percentage=0)
+        np.testing.assert_allclose(replay["akku_soc_pro_stunde"], result["akku_soc_pro_stunde"])
 
     def test_total_charge_model_reports_the_executed_total_factor(self, config_eos):
         """PV 1 kWh plus 2 kWh grid within a 2 kW limit: total 3 of 5 kWh -> 0.6."""
@@ -436,6 +439,71 @@ class TestGeneticSimulation:
         assert result["akku_soc_pro_stunde"][1] == pytest.approx(30.0)
         assert sim.ac_charge_hours is not None
         assert sim.ac_charge_hours[0] == pytest.approx(0.6)
+
+    @staticmethod
+    def _replay(config_eos, sim: GeneticSimulation, **kwargs: Any) -> dict[str, Any]:
+        """Simulate the reported controls again."""
+        assert sim.ac_charge_hours is not None and sim.dc_charge_hours is not None
+        replay, _ = _simulate(
+            config_eos,
+            ac=list(sim.ac_charge_hours),
+            dc=list(sim.dc_charge_hours),
+            **kwargs,
+        )
+        return replay
+
+    @pytest.mark.parametrize(
+        "pv_wh, expected_factor",
+        [
+            (6000.0, 0.5),  # PV fills the 2.5 kWh cap: the setpoint stays
+            (1000.0, 0.2),  # PV charged 1 kWh under the cap, the grid nothing
+        ],
+    )
+    def test_total_charge_model_keeps_the_pv_part_without_headroom(
+        self, config_eos, pv_wh, expected_factor
+    ):
+        """No grid headroom does not mean a zero total-charge setpoint."""
+        kwargs: dict[str, Any] = dict(
+            load=[0.0, 1000.0],
+            soc_percentage=0,
+            total_charge=True,
+            pv=[pv_wh, 0.0],
+            limit_w=0.0,
+        )
+        result, sim = _simulate(config_eos, ac=[0.5, 0.0], **kwargs)
+
+        assert sim.ac_charge_hours is not None
+        assert sim.ac_charge_hours[0] == pytest.approx(expected_factor)
+        replay = self._replay(config_eos, sim, **kwargs)
+        np.testing.assert_allclose(replay["akku_soc_pro_stunde"], result["akku_soc_pro_stunde"])
+        np.testing.assert_allclose(
+            replay["Netzbezug_Wh_pro_Stunde"], result["Netzbezug_Wh_pro_Stunde"]
+        )
+
+    def test_cancelled_ac_slot_keeps_its_pv_charge_permission(self, config_eos):
+        """Direct marketing: AC states carry dc_charge = 0, yet allow PV charging.
+
+        Zero limit, empty battery, 3 kWh PV: the slot stores the PV. Reporting
+        (ac=0, dc=0) would make it IDLE and lose that energy on replay.
+        """
+        kwargs: dict[str, Any] = dict(
+            load=[0.0, 1000.0],
+            soc_percentage=0,
+            pv=[3000.0, 0.0],
+            limit_w=0.0,
+            discharge=[0.0, 1.0],
+        )
+        result, sim = _simulate(config_eos, ac=[1.0, 0.0], dc=[0.0, 0.0], **kwargs)
+
+        assert result["akku_soc_pro_stunde"][1] == pytest.approx(30.0)
+        assert sim.ac_charge_hours is not None and sim.dc_charge_hours is not None
+        assert sim.ac_charge_hours[0] == 0.0
+        assert sim.dc_charge_hours[0] == 1.0
+        replay = self._replay(config_eos, sim, **kwargs)
+        np.testing.assert_allclose(replay["akku_soc_pro_stunde"], result["akku_soc_pro_stunde"])
+        np.testing.assert_allclose(
+            replay["Netzbezug_Wh_pro_Stunde"], result["Netzbezug_Wh_pro_Stunde"]
+        )
 
     def test_reported_factor_is_kept_when_the_limit_does_not_bind(self, config_eos):
         _, sim = _simulate(config_eos, load=[1000.0, 1000.0], ac=[0.5, 0.0], soc_percentage=0)

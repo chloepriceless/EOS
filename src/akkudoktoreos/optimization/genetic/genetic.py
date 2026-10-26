@@ -825,6 +825,11 @@ class GeneticSimulation(PydanticBaseModel):
                         )
                         if limited_factor < ac_charge_factor:
                             ac_charge_hours_array[hour] = limited_factor
+                            if limited_factor <= 0.0 and dc_charge_hours_fast[hour] == 0:
+                                # The AC state let PV charge the battery in this
+                                # slot (direct marketing gives it dc_charge = 0).
+                                # Without its AC charge, the plan keeps that as DC.
+                                dc_charge_hours_fast[hour] = 1
                     ac_energy, ac_charge_losses = inverter_fast.charge_battery_from_grid(
                         hour, ac_charge_factor, slot_grid_import_wh=energy_consumption_grid_actual
                     )
