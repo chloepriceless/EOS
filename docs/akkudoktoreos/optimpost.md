@@ -182,6 +182,12 @@ Verify prices against your local tariffs.
   (0-1). Must be > 0. Default `1.0` (backward compatible).
 - `max_ac_charge_power_w`: Maximum AC charging power in watts. `null` means no additional limit
   (battery's own `max_charge_power_w` applies). Set to `0` to disable AC charging. Default `null`.
+- `max_grid_import_power_w`: Maximum power drawn from the grid in watts (peak shaving). AC
+  charging is reduced first, then the battery covers load above the limit (also in slots the
+  plan holds it), within its discharge power, minimum SoC and `max_power_wh`. Import above the
+  limit that cannot be avoided is penalised with
+  `optimization.genetic.penalties.grid_import_limit_excess` (€/kWh, default `10.0`). `null`
+  means no limit. Default `null`.
 
 #### Efficiency Model
 

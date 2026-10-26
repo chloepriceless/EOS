@@ -8,7 +8,7 @@
       "name": "Apache 2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
-    "version": "v0.3.0.dev2610260646141478"
+    "version": "v0.3.0.dev2610261344381774"
   },
   "paths": {
     "/v1/measurement/battery-capacity/{battery_id}": {
@@ -11491,6 +11491,26 @@
               "GENETIC"
             ]
           },
+          "max_grid_import_power_w": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Grid Import Power W",
+            "description": "Maximum power drawn from the grid [W] (peak shaving), e.g. the capacity limit of a grid connection with interval metering. The optimizer reduces AC charging first; the battery then covers load above the limit within its discharge power, minimum SoC and max_power_w, also when the plan holds it. Import above the limit that cannot be avoided is penalised with optimization.genetic.penalties.grid_import_limit_excess. null means no limit. Default null.",
+            "examples": [
+              null,
+              8000
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
           "battery_id": {
             "anyOf": [
               {
@@ -11961,6 +11981,26 @@
             "examples": [
               false,
               true
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
+          "max_grid_import_power_w": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Grid Import Power W",
+            "description": "Maximum power drawn from the grid [W] (peak shaving), e.g. the capacity limit of a grid connection with interval metering. The optimizer reduces AC charging first; the battery then covers load above the limit within its discharge power, minimum SoC and max_power_w, also when the plan holds it. Import above the limit that cannot be avoided is penalised with optimization.genetic.penalties.grid_import_limit_excess. null means no limit. Default null.",
+            "examples": [
+              null,
+              8000
             ],
             "x-scope": [
               "GENETIC"
@@ -12447,6 +12487,23 @@
             "examples": [
               false,
               true
+            ]
+          },
+          "max_grid_import_power_w": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Grid Import Power W",
+            "description": "Maximum power drawn from the grid in watts (peak shaving), e.g. the capacity limit of a grid connection with interval metering. In every slot, AC charging of the battery is reduced first; the battery then covers load above the limit within its discharge power, minimum SoC and the inverter power, also when the plan holds it. Import above the limit that cannot be avoided adds the 'grid_import_limit_excess' penalty to the fitness. None means no limit.",
+            "examples": [
+              null,
+              8000
             ]
           }
         },

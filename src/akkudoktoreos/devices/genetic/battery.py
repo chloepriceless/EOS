@@ -313,6 +313,22 @@ class Battery:
         raw_soc_available_wh = max(self.soc_wh - self.min_soc_wh, 0.0)
         return min(raw_power_remaining_wh, raw_soc_available_wh) * self.discharging_efficiency
 
+    def remaining_charge_budget_wh(self, hour: int) -> float:
+        """Return the raw charge energy the power limits still allow in one slot.
+
+        The budget of ``charge_energy()`` before efficiency and SoC headroom:
+        ``max_charge_power_w`` x slot duration, capped by ``limit_slot_charge()``,
+        minus what the battery already took in this slot.
+        """
+        return max(
+            min(
+                self.max_charge_power_w * self.slot_duration_h,
+                self._charge_limit_raw_wh_per_slot[hour],
+            )
+            - self._charged_raw_wh_per_slot[hour],
+            0.0,
+        )
+
     def discharge_released(self, hour: int) -> bool:
         """Whether the plan lets the battery discharge in this slot."""
         return self.discharge_array[hour] != 0
@@ -341,7 +357,7 @@ class Battery:
         """Calculates the current state of charge in percentage."""
         return (self.soc_wh / self.capacity_wh) * 100
 
-    def discharge_energy(self, wh: float, hour: int) -> tuple[float, float]:
+    def discharge_energy(self, wh: float, hour: int, force: bool = False) -> tuple[float, float]:
         """Discharge energy from the battery.
 
         Discharge is limited by:
@@ -353,7 +369,9 @@ class Battery:
         Args:
             wh (float): Requested delivered energy in watt-hours.
             hour (int): Time index. If `self.discharge_array[hour] == 0`,
-                no discharge occurs.
+                no discharge occurs unless `force` is set.
+            force (bool): Discharge even if the plan does not release the
+                battery in this slot (peak shaving at the grid import limit).
 
         Returns:
             tuple[float, float]:
@@ -361,7 +379,7 @@ class Battery:
                 losses_wh (float): Conversion losses [Wh].
 
         """
-        if self.discharge_array[hour] == 0:
+        if not force and self.discharge_array[hour] == 0:
             return 0.0, 0.0
 
         # Raw extractable energy above minimum SoC

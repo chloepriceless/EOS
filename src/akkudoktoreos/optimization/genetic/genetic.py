@@ -30,6 +30,9 @@ from akkudoktoreos.optimization.genetic.geneticparams import (
     GeneticEnergyManagementParameters,
     GeneticOptimizationParameters,
 )
+from akkudoktoreos.optimization.genetic.geneticsettings import (
+    GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH,
+)
 from akkudoktoreos.optimization.genetic.geneticsolution import (
     GeneticSimulationResult,
     GeneticSolution,
@@ -674,6 +677,9 @@ class GeneticSimulation(PydanticBaseModel):
         elect_price_hourly_fast = _slot_values(elect_price_hourly_fast)
         elect_revenue_per_hour_arr_fast = _slot_values(elect_revenue_per_hour_arr_fast)
         bat_grid_export_hours_fast = _slot_values(bat_grid_export_hours_fast)
+        # The array itself, for reporting AC charge factors a grid import limit lowers.
+        ac_charge_hours_array = ac_charge_hours_fast
+        max_grid_import_wh_fast = inverter_fast.max_grid_import_wh if inverter_fast else None
         ac_charge_hours_fast = _slot_values(ac_charge_hours_fast)
         ev_charge_hours_fast = _slot_values(ev_charge_hours_fast)
         if battery_fast:
@@ -810,8 +816,17 @@ class GeneticSimulation(PydanticBaseModel):
             # AC PV Battery Charge
             if ac_charge_factor > 0.0 and battery_fast:
                 if inverter_fast:
+                    if max_grid_import_wh_fast is not None:
+                        # With a grid import limit, the charge only fills what
+                        # the slot's import (load, EV) leaves of the limit. The
+                        # reported plan shows the factor that was simulated.
+                        limited_factor = inverter_fast.grid_limited_ac_charge_factor(
+                            hour, ac_charge_factor, energy_consumption_grid_actual
+                        )
+                        if limited_factor < ac_charge_factor:
+                            ac_charge_hours_array[hour] = limited_factor
                     ac_energy, ac_charge_losses = inverter_fast.charge_battery_from_grid(
-                        hour, ac_charge_factor
+                        hour, ac_charge_factor, slot_grid_import_wh=energy_consumption_grid_actual
                     )
                 else:
                     # Without an inverter the grid charges the battery losslessly
@@ -1342,6 +1357,11 @@ class GeneticOptimization(OptimizationBase):
                 charge_rates=self.bat_possible_charge_values,
                 export_rates=self.bat_possible_grid_export_values,
                 direct_marketing=self.optimize_battery_grid_export,
+                grid_import_penalty_euro_per_wh=(
+                    self._grid_import_limit_penalty_euro_per_wh()
+                    if inverter.max_grid_import_wh is not None
+                    else 0.0
+                ),
             )
         if curve.energy_wh:
             self._terminal_value_reason = ""
@@ -3529,6 +3549,18 @@ class GeneticOptimization(OptimizationBase):
         except (TypeError, ValueError):
             return _pack_genes([int(value) for value in relevant])
 
+    def _grid_import_limit_penalty_euro_per_wh(self) -> float:
+        """Penalty per Wh imported above the grid import limit [EUR/Wh].
+
+        Configured as ``penalties.grid_import_limit_excess`` in EUR/kWh. A
+        penalties dict without the key uses the default.
+        """
+        try:
+            penalty_euro_per_kwh = float(self._genetic_cfg.penalties["grid_import_limit_excess"])
+        except Exception:
+            penalty_euro_per_kwh = GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH
+        return penalty_euro_per_kwh / 1000.0
+
     def _ev_soc_at_deadline(self, simulation_result: dict[str, Any], start_slot: int) -> float:
         """EV state of charge the target is checked against [%].
 
@@ -3762,6 +3794,26 @@ class GeneticOptimization(OptimizationBase):
                         ac_wh = dc_wh / max(inv.ac_to_dc_efficiency, 1e-9)
                         excess_cost_per_wh = break_even_price - best_uncovered_price
                         gesamtbilanz += ac_wh * excess_cost_per_wh * ac_penalty_factor
+
+        # --- Grid import limit penalty ---
+        # Import above max_grid_import_power_w that the battery could not shave
+        # (empty, at its power limit or the inverter's) is simulated as is. The
+        # penalty per kWh of that excess makes the optimizer keep reserve and
+        # charge earlier. It is computed from the simulated import, i.e. from
+        # what the battery actually delivered.
+        max_grid_import_wh = getattr(self.simulation.inverter, "max_grid_import_wh", None)
+        if max_grid_import_wh is not None:
+            excess_wh = float(
+                np.nansum(
+                    np.maximum(
+                        np.asarray(simulation_result["Netzbezug_Wh_pro_Stunde"], dtype=float)
+                        - max_grid_import_wh,
+                        0.0,
+                    )
+                )
+            )
+            if excess_wh > 0.0:
+                gesamtbilanz += excess_wh * self._grid_import_limit_penalty_euro_per_wh()
 
         if self.optimize_ev and parameters.ev and self.simulation.ev:
             try:

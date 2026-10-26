@@ -106,6 +106,24 @@ class InverterParameters(DeviceParameters):
         },
     )
 
+    max_grid_import_power_w: Optional[float] = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        json_schema_extra={
+            "description": (
+                "Maximum power drawn from the grid in watts (peak shaving), e.g. the "
+                "capacity limit of a grid connection with interval metering. In every "
+                "slot, AC charging of the battery is reduced first; the battery then "
+                "covers load above the limit within its discharge power, minimum SoC "
+                "and the inverter power, also when the plan holds it. Import above the "
+                "limit that cannot be avoided adds the 'grid_import_limit_excess' "
+                "penalty to the fitness. None means no limit."
+            ),
+            "examples": [None, 8000],
+        },
+    )
+
     @field_validator("dc_to_ac_efficiency_curve")
     @classmethod
     def _validate_dc_to_ac_efficiency_curve(
@@ -148,6 +166,13 @@ class Inverter:
         # slot-independent charge-factor limit.
         self.max_ac_charge_power_w = self.parameters.max_ac_charge_power_w
         self.ac_charge_limits_total_charge = self.parameters.ac_charge_limits_total_charge
+        # The grid import limit is a power [W]; per slot it is the energy
+        # limit * slot_duration_h. None means no limit.
+        self.max_grid_import_wh: Optional[float] = (
+            None
+            if self.parameters.max_grid_import_power_w is None
+            else self.parameters.max_grid_import_power_w * self.slot_duration_h
+        )
 
     def dc_to_ac_efficiency_at(self, ac_wh: float) -> float:
         """Return the DC-to-AC efficiency of a conversion delivering ``ac_wh`` in one slot.
@@ -219,12 +244,67 @@ class Inverter:
                 hour, self.battery.max_charge_power_w * self.slot_duration_h * factor
             )
 
-    def charge_battery_from_grid(self, hour: int, factor: float) -> tuple[float, float]:
+    def grid_limited_ac_charge_factor(
+        self, hour: int, factor: float, slot_grid_import_wh: float
+    ) -> float:
+        """Return the AC charge factor that keeps the slot within the grid import limit.
+
+        AC charging is the first consumer to give way to ``max_grid_import_power_w``:
+        the grid may add at most the headroom between the slot's import without the
+        charge, ``slot_grid_import_wh``, and the limit. Call it after
+        ``process_energy`` of the slot, when PV has already charged the battery.
+
+        The factor keeps the meaning of the inverter model. Default model: share of
+        the charge budget PV left in this slot. With ``ac_charge_limits_total_charge``:
+        share of the rated charge power for PV and grid together.
+
+        Args:
+            hour: Slot index.
+            factor: AC charge factor of the slot.
+            slot_grid_import_wh: Grid import of the slot without the AC charge [Wh].
+
+        Returns:
+            float: ``factor`` without a limit or when it fits, else the lower factor
+            that fills the headroom (0.0 if there is none).
+        """
+        max_grid_import_wh = self.max_grid_import_wh
+        battery = self.battery
+        if max_grid_import_wh is None or not battery or factor <= 0.0:
+            return factor
+        headroom_ac_wh = max_grid_import_wh - slot_grid_import_wh
+        if headroom_ac_wh <= 0.0:
+            return 0.0
+        # The battery takes DC energy; the grid supplies it / ac_to_dc_efficiency.
+        headroom_dc_wh = headroom_ac_wh * self.ac_to_dc_efficiency
+        budget_wh = battery.remaining_charge_budget_wh(hour)
+        if budget_wh * (1.0 if self.ac_charge_limits_total_charge else factor) <= headroom_dc_wh:
+            return factor
+        if self.ac_charge_limits_total_charge:
+            # The grid fills what PV left of the slot cap (factor x rated power);
+            # lower the cap to PV charge plus headroom.
+            rated_wh = battery.max_charge_power_w * self.slot_duration_h
+            return (rated_wh * factor - budget_wh + headroom_dc_wh) / rated_wh
+        return headroom_dc_wh / budget_wh
+
+    def charge_battery_from_grid(
+        self, hour: int, factor: float, slot_grid_import_wh: float = 0.0
+    ) -> tuple[float, float]:
         """Charge the battery from the grid after PV was processed in this slot.
 
         Default model: the grid adds ``factor`` of the rated charge power on top
         of the PV charge. With ``ac_charge_limits_total_charge`` the grid only
         fills what PV left of the slot cap set by ``begin_ac_charge_slot``.
+
+        With ``max_grid_import_power_w`` the factor is lowered by
+        ``grid_limited_ac_charge_factor`` so that the slot's grid import,
+        ``slot_grid_import_wh`` plus the charge, stays within the limit.
+
+        Args:
+            hour: Slot index.
+            factor: AC charge factor of the slot.
+            slot_grid_import_wh: Grid import of the slot without the AC charge
+                [Wh], as returned by ``process_energy``. Only used with a grid
+                import limit.
 
         Returns:
             tuple[float, float]: AC energy drawn from the grid [Wh] and the
@@ -232,6 +312,15 @@ class Inverter:
         """
         if not self.battery or factor <= 0.0:
             return 0.0, 0.0
+        if self.max_grid_import_wh is not None:
+            limited_factor = self.grid_limited_ac_charge_factor(hour, factor, slot_grid_import_wh)
+            if limited_factor <= 0.0:
+                return 0.0, 0.0
+            if limited_factor < factor and self.ac_charge_limits_total_charge:
+                self.battery.limit_slot_charge(
+                    hour, self.battery.max_charge_power_w * self.slot_duration_h * limited_factor
+                )
+            factor = limited_factor
         if self.ac_charge_limits_total_charge:
             stored, battery_losses = self.battery.charge_energy(
                 self.battery.max_charge_power_w * self.slot_duration_h * factor, hour
@@ -265,18 +354,32 @@ class Inverter:
             )
         return battery_discharge_dc * dc_to_ac_efficiency
 
-    def _discharge_battery_to_ac(self, requested_ac_wh: float, hour: int) -> tuple[float, float]:
-        """Discharge battery energy and convert it to AC energy."""
+    def _discharge_battery_to_ac(
+        self, requested_ac_wh: float, hour: int, force: bool = False
+    ) -> tuple[float, float]:
+        """Discharge battery energy and convert it to AC energy.
+
+        Args:
+            requested_ac_wh: Requested AC energy [Wh].
+            hour: Slot index.
+            force: Discharge even if the plan does not release the battery in
+                this slot (peak shaving at the grid import limit).
+        """
         battery = self.battery
         if not battery or requested_ac_wh <= 0.0:
             return 0.0, 0.0
         if type(battery) is not Battery:
             # Another battery implementation: ask it, step by step.
-            if not battery.discharge_released(hour):
+            if not force and not battery.discharge_released(hour):
                 return 0.0, 0.0
             dc_to_ac_efficiency = self.dc_to_ac_efficiency_at(requested_ac_wh)
             dc_request = requested_ac_wh / dc_to_ac_efficiency
-            battery_discharge_dc, discharge_losses = battery.discharge_energy(dc_request, hour)
+            if force:
+                battery_discharge_dc, discharge_losses = battery.discharge_energy(
+                    dc_request, hour, force=True
+                )
+            else:
+                battery_discharge_dc, discharge_losses = battery.discharge_energy(dc_request, hour)
             battery_discharge_ac = self._delivered_ac_wh(
                 battery_discharge_dc, dc_request, requested_ac_wh, dc_to_ac_efficiency
             )
@@ -288,7 +391,7 @@ class Inverter:
         # the efficiency and Battery.discharge_energy() are computed in one go,
         # without the nested calls. The arithmetic is that of
         # Battery.discharge_energy(); keep both in step.
-        if battery.discharge_array[hour] == 0:
+        if not force and battery.discharge_array[hour] == 0:
             # Not released in this slot: the battery delivers nothing.
             return 0.0, 0.0
         # With an efficiency curve, the efficiency is taken at the requested AC
@@ -429,6 +532,34 @@ class Inverter:
             losses += battery_discharge_losses
 
         grid_import = remaining_load
+
+        # Peak shaving: the battery covers load above the grid import limit,
+        # also when the plan holds it in this slot - as the site controller
+        # that enforces the limit does. A released battery has already served
+        # all of the load it can above.
+        max_grid_import_wh = self.max_grid_import_wh
+        if (
+            max_grid_import_wh is not None
+            and grid_import > max_grid_import_wh
+            and battery
+            and remaining_inverter_ac_capacity > 0.0
+        ):
+            excess_wh = grid_import - max_grid_import_wh
+            shaved_ac_wh, shaving_losses = self._discharge_battery_to_ac(
+                remaining_inverter_ac_capacity
+                if remaining_inverter_ac_capacity < excess_wh
+                else excess_wh,
+                hour,
+                force=True,
+            )
+            grid_import = grid_import - shaved_ac_wh
+            if grid_import < 0.0:
+                grid_import = 0.0
+            remaining_inverter_ac_capacity = remaining_inverter_ac_capacity - shaved_ac_wh
+            if remaining_inverter_ac_capacity < 0.0:
+                remaining_inverter_ac_capacity = 0.0
+            battery_discharge_ac += shaved_ac_wh
+            losses += shaving_losses
 
         # Without PV surplus (night slots, or all PV consumed directly) there is
         # nothing to charge, export or curtail. (!= instead of >: a NaN forecast

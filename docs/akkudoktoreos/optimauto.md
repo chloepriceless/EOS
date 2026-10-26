@@ -213,6 +213,12 @@ The behavior of the genetic algorithm can be customized using the following conf
   A value of `1.0` (default) means the penalty equals the actual economic loss in €.
   Use larger values (e.g. `3.0`) to make the optimizer more aggressively avoid unprofitable
   AC charging, or `0.0` to disable this penalty entirely.
+
+- `grid_import_limit_excess`:
+  Penalty in €/kWh for energy imported above the inverter's `max_grid_import_power_w`
+  that the battery cannot shave. Only applies when that limit is set. The default `10.0` is far
+  above any energy price, so the optimizer keeps reserve and charges earlier wherever the
+  battery can avoid the excess. The tail lookahead uses the same penalty.
 :::
 
 #### Value Formats
@@ -241,7 +247,8 @@ The behavior of the genetic algorithm can be customized using the following conf
             "seed": null,
             "penalties": {
                 "ev_soc_miss": 10,
-                "ac_charge_break_even": 1.0
+                "ac_charge_break_even": 1.0,
+                "grid_import_limit_excess": 10.0
             }
         }
     }
@@ -313,6 +320,24 @@ The inverter supports separate AC↔DC conversion efficiencies:
   where stored energy is valued without a specific discharge, e.g. the energy left in the
   battery at the end of the horizon and the AC charge break-even. Choose the typical load
   the battery serves. Only used with `dc_to_ac_efficiency_curve`. Default `0.06`.
+- `max_grid_import_power_w`: Maximum power drawn from the grid in watts (peak shaving), e.g.
+  the capacity limit of a commercial grid connection with interval metering. Default `null`
+  (no limit, unchanged behaviour). The limit is a power; per slot the grid may supply
+  `max_grid_import_power_w × slot duration` (2 kWh per 15-minute slot at 8 kW). In every slot
+  the simulation:
+
+  1. reduces AC (grid) charging of the battery so that load plus charging stays within the
+     limit; the reported `ac_charge` of the slot is the reduced factor,
+  2. lets the battery cover load above the limit within its discharge power, its minimum SoC
+     and `max_power_w` - also in slots where the plan holds the battery, as the site
+     controller that enforces the limit does,
+  3. imports what is still above the limit and adds `penalties.grid_import_limit_excess` per
+     kWh of that excess to the fitness.
+
+  Household load, home appliances and EV charging all count towards the limit. A slot in which
+  the battery only shaves peaks keeps `discharge_allowed = 0`: the plan holds the battery and
+  relies on the limit being enforced on site (e.g. by the inverter's or energy manager's peak
+  shaving function), as the simulation assumes.
 
 **Example with an efficiency curve:**
 
