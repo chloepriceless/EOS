@@ -358,6 +358,21 @@ The inverter supports separate AC↔DC conversion efficiencies:
 }
 ```
 
+The GENETIC algorithm can restrict EV charging to the time the vehicle is connected:
+
+- `charge_start_datetime`: arrival or plug-in time. Before it the vehicle neither charges nor
+  discharges, and its state of charge stays at the initial state of charge. Supply the state of
+  charge you expect on arrival as initial state of charge (for `POST /v1/optimize` in `soc`,
+  since there is no fresh measurement while the vehicle is away). A slot that begins before the
+  charge start is not used; a charge start that has already passed makes the vehicle available at
+  once. A vehicle arriving after the control horizon gets no charging plan in this run.
+- `min_soc_deadline_datetime`: departure time by which `min_soc_percentage` has to be reached.
+  A slot that ends after the departure does not count. A departure at or before the charge start
+  can not be met; it is then ignored and the target applies at the end of the horizon.
+
+A date time without timezone is read as local time. Without these settings, the vehicle can charge
+throughout the horizon and has to reach its target by the end of it.
+
 #### Battery simulation configuration
 
 **Example:**
