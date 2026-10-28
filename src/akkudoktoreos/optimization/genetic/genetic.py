@@ -7,7 +7,9 @@ import math
 import multiprocessing
 import os
 import random
+import signal
 import sys
+import threading
 import time
 from array import array
 from collections import OrderedDict, defaultdict
@@ -200,6 +202,8 @@ SERVER_CPU_RESERVE = 0.25
 # results cross the process boundary.
 MAX_EVALUATION_WORKERS = 2
 EVALUATION_BATCH_TIMEOUT_SECONDS = 120.0
+# Time the workers get to exit after Pool.terminate() before they are killed.
+EVALUATION_POOL_STOP_TIMEOUT_SECONDS = 10.0
 _WORKER_OPTIMIZER: Optional[Any] = None
 
 
@@ -277,13 +281,42 @@ def worker_cpu_set(workers: int, allowed: Optional[set[int]] = None) -> Optional
 
 
 def _evaluation_worker_init(cpus: Optional[set[int]] = None) -> None:
-    """Evaluate without the run cache in a worker; the parent owns the cache."""
+    """Evaluate without the run cache in a worker; the parent owns the cache.
+
+    A worker is forked from the server process and inherits its Python signal
+    handlers. uvicorn's SIGTERM/SIGINT handler only asks the server to shut down,
+    so a worker would survive the SIGTERM of ``Pool.terminate()``. Terminate also
+    keeps the task queue's read lock, so a surviving worker waits for its next
+    task forever and ``Pool.join()`` never returns: after a batch timeout always,
+    after a normal run whenever a worker had not yet picked up its stop sentinel.
+    Workers therefore get the default SIGTERM action back and leave Ctrl-C
+    (SIGINT, sent to the whole process group) to the parent, which stops them.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     if _WORKER_OPTIMIZER is not None:
         _WORKER_OPTIMIZER._fitness_cache_enabled = False
     if cpus:
         try:
             os.sched_setaffinity(0, cpus)
         except (AttributeError, OSError):
+            pass
+
+
+def _kill_unstopped_workers(pool: Any) -> None:
+    """Kill the evaluation workers that are still running after Pool.terminate()."""
+    workers = [worker for worker in getattr(pool, "_pool", ()) if worker.is_alive()]
+    if not workers:
+        return
+    logger.warning(
+        "Evaluation workers {} did not stop within {} s; killing them.",
+        [worker.pid for worker in workers],
+        EVALUATION_POOL_STOP_TIMEOUT_SECONDS,
+    )
+    for worker in workers:
+        try:
+            worker.kill()
+        except (OSError, ValueError):
             pass
 
 
@@ -2982,9 +3015,23 @@ class GeneticOptimization(OptimizationBase):
         pool = getattr(self, "_evaluation_pool", None)
         self._evaluation_pool = None
         _WORKER_OPTIMIZER = None
-        if pool is not None:
+        if pool is None:
+            return
+        # terminate() stops the workers with SIGTERM and waits for each of them.
+        # A worker that gets the signal before _evaluation_worker_init() has run
+        # (it started late on a busy machine) still has the server's handler and
+        # survives; kill it, so the run does not hang. terminate() has taken the
+        # task queue's read lock long before, so no worker is killed holding it.
+        killer = threading.Timer(
+            EVALUATION_POOL_STOP_TIMEOUT_SECONDS, _kill_unstopped_workers, (pool,)
+        )
+        killer.daemon = True
+        killer.start()
+        try:
             pool.terminate()
             pool.join()
+        finally:
+            killer.cancel()
 
     def _fresh_population(self, count: int, *, educated_fraction: float) -> list[Any]:
         """Create a mixed set of current educated guesses and random immigrants."""

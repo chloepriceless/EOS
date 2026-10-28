@@ -1,9 +1,15 @@
 """Parallel fitness evaluation gives the same result as evaluating in one process."""
 
 import multiprocessing
+import os
+import signal
+import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
+import uvicorn
 
 from akkudoktoreos.config.config import ConfigEOS
 from akkudoktoreos.core.cache import CacheEnergyManagementStore
@@ -144,6 +150,187 @@ def test_failed_batch_falls_back_to_serial(config_eos: ConfigEOS, monkeypatch):
     assert used == [2]
     assert fallback.start_solution == serial.start_solution
     assert fallback.ac_charge == serial.ac_charge
+
+
+class _PoolOnly(GeneticOptimization):
+    """Just the evaluation pool of an optimization: two unpinned workers."""
+
+    def _configured_evaluation_workers(self) -> int:
+        return 2
+
+    def _pin_workers(self) -> bool:
+        return False
+
+
+def _square(value: int) -> int:
+    return value * value
+
+
+_original_evaluation_worker = genetic_module._evaluation_worker
+
+
+def _slow_evaluation_worker(genome):
+    time.sleep(5)  # far beyond the (patched) batch timeout
+    return _original_evaluation_worker(genome)
+
+
+@pytest.fixture
+def server_signal_handlers():
+    """Run the test under the signal handlers uvicorn.run() installs for the server.
+
+    uvicorn's handler only asks the server to shut down; the evaluation workers
+    are forked from that process and inherit it.
+    """
+    server = uvicorn.Server(uvicorn.Config("akkudoktoreos.server.eos:app"))
+    with server.capture_signals():
+        assert signal.getsignal(signal.SIGTERM) == server.handle_exit
+        yield
+
+
+def _in_thread(function, timeout: float, rescue) -> bool:
+    """Run ``function`` in a thread; on timeout call ``rescue`` and report a hang."""
+    thread = threading.Thread(target=function, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if not thread.is_alive():
+        return True
+    rescue()  # kill the stuck workers so the test run itself does not hang
+    thread.join(timeout)
+    return False
+
+
+def _kill(processes) -> None:
+    for process in processes:
+        if process.is_alive():
+            os.kill(process.pid, signal.SIGKILL)
+
+
+def _worker_signal_dispositions(_task: int) -> tuple[bool, bool]:
+    """In a worker: (SIGTERM has its default action, SIGINT is ignored)."""
+    return (
+        signal.getsignal(signal.SIGTERM) is signal.SIG_DFL,
+        signal.getsignal(signal.SIGINT) is signal.SIG_IGN,
+    )
+
+
+_original_evaluation_worker_init = genetic_module._evaluation_worker_init
+
+
+def _late_evaluation_worker_init(*args):
+    time.sleep(2)  # a worker that starts late on a busy machine
+    _original_evaluation_worker_init(*args)
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_workers_do_not_inherit_server_signal_handlers(server_signal_handlers, monkeypatch):
+    """Pool.terminate() stops the workers with SIGTERM; they must not survive it."""
+    monkeypatch.setattr(genetic_module, "EVALUATION_POOL_STOP_TIMEOUT_SECONDS", 2.0)
+    optimization = _PoolOnly.__new__(_PoolOnly)
+    starter = threading.Thread(target=optimization._start_evaluation_pool)
+    starter.start()  # like the server: the run is not on the main thread
+    starter.join()
+    pool = optimization._evaluation_pool
+    assert pool is not None
+    try:
+        workers = list(pool._pool)
+        dispositions = pool.map(_worker_signal_dispositions, range(8), chunksize=1)
+    finally:
+        stopped = _in_thread(
+            optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool))
+        )
+    assert set(dispositions) == {(True, True)}
+    assert stopped, "stopping the pool hung"
+    assert not any(worker.is_alive() for worker in workers)
+    # The server process itself keeps its handlers.
+    assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="needs Linux semaphores and /proc"
+)
+def test_pool_stop_with_a_late_idle_worker_does_not_hang(server_signal_handlers):
+    """Stopping the pool must not depend on which process wins the task-queue lock.
+
+    Pool.terminate() takes the read lock of the task queue for good. A worker
+    that has not got its stop sentinel by then (on a busy machine it may simply
+    not have been scheduled) can only end through SIGTERM. Freezing that worker
+    for a moment makes the parent win the lock every time.
+    """
+    optimization = _PoolOnly.__new__(_PoolOnly)
+    optimization._start_evaluation_pool()
+    pool = optimization._evaluation_pool
+    assert pool is not None
+    pool.map(_square, range(20))
+    workers = list(pool._pool)
+    time.sleep(0.5)  # both idle: one reads the task pipe, one waits for its lock
+
+    def waits_for_lock(worker) -> bool:
+        try:
+            with open(f"/proc/{worker.pid}/syscall") as syscall:
+                return syscall.read().split()[0] in ("202", "98")  # futex x86_64/aarch64
+        except (OSError, IndexError):
+            return False
+
+    late = next((worker for worker in workers if waits_for_lock(worker)), None)
+    if late is None:
+        _in_thread(optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool)))
+        pytest.skip("cannot tell which worker waits for the lock")
+    os.kill(late.pid, signal.SIGSTOP)
+    resume = threading.Timer(1.0, os.kill, (late.pid, signal.SIGCONT))
+    resume.start()
+    try:
+        stopped = _in_thread(
+            optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool))
+        )
+    finally:
+        resume.join()
+    assert stopped, "stopping the pool hung"
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_batch_timeout_under_server_signal_handlers_falls_back_to_serial(
+    config_eos: ConfigEOS, monkeypatch, server_signal_handlers
+):
+    """A batch that times out stops the busy workers and the run continues serially."""
+    serial, _ = _run(config_eos, 1, None)
+
+    monkeypatch.setattr(genetic_module, "EVALUATION_BATCH_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(genetic_module, "_evaluation_worker", _slow_evaluation_worker)
+    outcome: dict = {}
+
+    def run_parallel() -> None:
+        outcome["result"] = _run(config_eos, 2, None)
+
+    finished = _in_thread(run_parallel, 60, lambda: _kill(multiprocessing.active_children()))
+
+    assert finished, "stopping the busy workers after the batch timeout hung"
+    fallback, used = outcome["result"]
+    assert used == [2]
+    assert fallback.start_solution == serial.start_solution
+    assert fallback.ac_charge == serial.ac_charge
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_pool_stop_kills_a_worker_that_got_sigterm_before_its_init(
+    server_signal_handlers, monkeypatch
+):
+    """A worker still starting up when the pool stops runs the server's handler.
+
+    It survives SIGTERM, finishes its start and then waits for the task queue
+    that terminate() keeps locked. Stopping the pool kills it after a while.
+    """
+    monkeypatch.setattr(genetic_module, "_evaluation_worker_init", _late_evaluation_worker_init)
+    monkeypatch.setattr(genetic_module, "EVALUATION_POOL_STOP_TIMEOUT_SECONDS", 3.0)
+    optimization = _PoolOnly.__new__(_PoolOnly)
+    optimization._start_evaluation_pool()
+    pool = optimization._evaluation_pool
+    assert pool is not None
+    workers = list(pool._pool)
+    started = time.monotonic()
+    stopped = _in_thread(optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool)))
+    assert stopped, "stopping the pool hung"
+    assert time.monotonic() - started < 15
+    assert not any(worker.is_alive() for worker in workers)
 
 
 def test_unsupported_fork_falls_back_to_serial(config_eos: ConfigEOS, monkeypatch):
