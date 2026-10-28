@@ -206,11 +206,16 @@ def _kill(processes) -> None:
 
 
 def _worker_signal_dispositions(_task: int) -> tuple[bool, bool]:
-    """In a worker: (SIGTERM has its default action, SIGINT is ignored)."""
+    """In a worker: (SIGTERM is ignored, SIGINT is ignored)."""
     return (
-        signal.getsignal(signal.SIGTERM) is signal.SIG_DFL,
+        signal.getsignal(signal.SIGTERM) is signal.SIG_IGN,
         signal.getsignal(signal.SIGINT) is signal.SIG_IGN,
     )
+
+
+def _slow_square(value: int) -> int:
+    time.sleep(0.5)
+    return value * value
 
 
 _original_evaluation_worker_init = genetic_module._evaluation_worker_init
@@ -222,9 +227,8 @@ def _late_evaluation_worker_init(*args):
 
 
 @pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
-def test_workers_do_not_inherit_server_signal_handlers(server_signal_handlers, monkeypatch):
-    """Pool.terminate() stops the workers with SIGTERM; they must not survive it."""
-    monkeypatch.setattr(genetic_module, "EVALUATION_POOL_STOP_TIMEOUT_SECONDS", 2.0)
+def test_workers_do_not_run_server_signal_handlers(server_signal_handlers):
+    """Workers ignore SIGTERM/SIGINT instead of running the server's handlers."""
     optimization = _PoolOnly.__new__(_PoolOnly)
     starter = threading.Thread(target=optimization._start_evaluation_pool)
     starter.start()  # like the server: the run is not on the main thread
@@ -242,7 +246,36 @@ def test_workers_do_not_inherit_server_signal_handlers(server_signal_handlers, m
     assert stopped, "stopping the pool hung"
     assert not any(worker.is_alive() for worker in workers)
     # The server process itself keeps its handlers.
-    assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+    assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN)
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_sigterm_to_the_process_group_does_not_break_a_batch(server_signal_handlers):
+    """A service manager stops the server with SIGTERM to all its processes.
+
+    The workers finish the running batch; the server process decides when the
+    run ends and stops them.
+    """
+    optimization = _PoolOnly.__new__(_PoolOnly)
+    optimization._start_evaluation_pool()
+    pool = optimization._evaluation_pool
+    assert pool is not None
+    try:
+        pool.map(_square, range(4))
+        workers = list(pool._pool)
+        batch = pool.map_async(_slow_square, range(8), chunksize=1)
+        time.sleep(0.2)
+        for worker in workers:
+            os.kill(worker.pid, signal.SIGTERM)
+        results = batch.get(timeout=30)
+        alive = [worker.is_alive() for worker in workers]
+    finally:
+        stopped = _in_thread(
+            optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool))
+        )
+    assert results == [value * value for value in range(8)]
+    assert alive == [True, True]
+    assert stopped, "stopping the pool hung"
 
 
 @pytest.mark.skipif(
@@ -290,16 +323,13 @@ def test_pool_stop_with_a_late_idle_worker_does_not_hang(server_signal_handlers)
 @pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="needs Linux semaphores and /proc"
 )
-def test_pool_stop_never_kills_the_worker_holding_the_task_queue(
-    server_signal_handlers, monkeypatch
-):
+def test_pool_stop_never_kills_the_worker_holding_the_task_queue(server_signal_handlers):
     """The idle worker that reads the task pipe holds the queue's read lock.
 
-    If it is paused past the stop timeout, killing it would leave the lock
-    taken for good and terminate() waiting for it forever. The stop has to
-    wait until the worker resumes, takes its sentinel and releases the lock.
+    Killing it would leave the lock taken for good and terminate() waiting for
+    it forever. While it is paused, the stop has to wait until it resumes,
+    takes its sentinel and releases the lock.
     """
-    monkeypatch.setattr(genetic_module, "EVALUATION_POOL_STOP_TIMEOUT_SECONDS", 1.0)
     optimization = _PoolOnly.__new__(_PoolOnly)
     optimization._start_evaluation_pool()
     pool = optimization._evaluation_pool
@@ -361,11 +391,10 @@ def test_pool_stop_kills_a_worker_that_got_sigterm_before_its_init(
 ):
     """A worker still starting up when the pool stops runs the server's handler.
 
-    It survives SIGTERM, finishes its start and then waits for the task queue
-    that terminate() keeps locked. Stopping the pool kills it after a while.
+    It would survive SIGTERM, finish its start and then wait for the task queue
+    that terminate() keeps locked. The pool stops its workers with SIGKILL.
     """
     monkeypatch.setattr(genetic_module, "_evaluation_worker_init", _late_evaluation_worker_init)
-    monkeypatch.setattr(genetic_module, "EVALUATION_POOL_STOP_TIMEOUT_SECONDS", 3.0)
     optimization = _PoolOnly.__new__(_PoolOnly)
     optimization._start_evaluation_pool()
     pool = optimization._evaluation_pool
@@ -374,7 +403,7 @@ def test_pool_stop_kills_a_worker_that_got_sigterm_before_its_init(
     started = time.monotonic()
     stopped = _in_thread(optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool)))
     assert stopped, "stopping the pool hung"
-    assert time.monotonic() - started < 15
+    assert time.monotonic() - started < 10
     assert not any(worker.is_alive() for worker in workers)
 
 

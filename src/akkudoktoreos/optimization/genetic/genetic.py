@@ -5,11 +5,11 @@ import ctypes.util
 import gc
 import math
 import multiprocessing
+import multiprocessing.pool
 import os
 import random
 import signal
 import sys
-import threading
 import time
 from array import array
 from collections import OrderedDict, defaultdict
@@ -202,8 +202,6 @@ SERVER_CPU_RESERVE = 0.25
 # results cross the process boundary.
 MAX_EVALUATION_WORKERS = 2
 EVALUATION_BATCH_TIMEOUT_SECONDS = 120.0
-# Time the workers get to exit after Pool.terminate() before they are killed.
-EVALUATION_POOL_STOP_TIMEOUT_SECONDS = 10.0
 _WORKER_OPTIMIZER: Optional[Any] = None
 
 
@@ -281,18 +279,16 @@ def worker_cpu_set(workers: int, allowed: Optional[set[int]] = None) -> Optional
 
 
 def _evaluation_worker_init(cpus: Optional[set[int]] = None) -> None:
-    """Evaluate without the run cache in a worker; the parent owns the cache.
+    """Prepare a forked evaluation worker; the parent owns the run cache.
 
-    A worker is forked from the server process and inherits its Python signal
-    handlers. uvicorn's SIGTERM/SIGINT handler only asks the server to shut down,
-    so a worker would survive the SIGTERM of ``Pool.terminate()``. Terminate also
-    keeps the task queue's read lock, so a surviving worker waits for its next
-    task forever and ``Pool.join()`` never returns: after a batch timeout always,
-    after a normal run whenever a worker had not yet picked up its stop sentinel.
-    Workers therefore get the default SIGTERM action back and leave Ctrl-C
-    (SIGINT, sent to the whole process group) to the parent, which stops them.
+    The worker ignores SIGTERM and SIGINT. Sent to the whole process group
+    (Ctrl-C, a service manager stopping the server) they are meant for the
+    server process, which finishes or aborts the run and stops the workers
+    itself (see ``_EvaluationPool``). Without this, a worker would run the
+    signal handler it inherited from the server - uvicorn's only asks the
+    server to shut down - or die in the middle of a batch.
     """
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if _WORKER_OPTIMIZER is not None:
         _WORKER_OPTIMIZER._fitness_cache_enabled = False
@@ -303,43 +299,22 @@ def _evaluation_worker_init(cpus: Optional[set[int]] = None) -> None:
             pass
 
 
-def _task_queue_locked_by_us(pool: Any) -> bool:
-    """Whether this process holds the read lock of the pool's task queue.
+class _EvaluationPool(multiprocessing.pool.Pool):
+    """Process pool whose ``terminate()`` stops the workers with SIGKILL.
 
-    In this process only Pool.terminate() takes that lock (and keeps it); the
-    workers take it in their own processes.
+    ``Pool.terminate()`` keeps the task queue's read lock and then stops the
+    workers with SIGTERM. A worker that survives it - because it ignores the
+    signal, still runs the server's inherited handler (uvicorn's only asks the
+    server to shut down) or got it before its initializer ran - waits for that
+    lock forever, and ``Pool.join()`` with it. SIGKILL cannot be caught; the
+    pool sends it at the same point it would send SIGTERM.
     """
-    try:
-        return bool(pool._inqueue._rlock._semlock._count() > 0)
-    except (AttributeError, OSError):
-        return False
 
-
-def _watch_pool_stop(pool: Any, stopped: threading.Event) -> None:
-    """Kill the evaluation workers that Pool.terminate() could not stop.
-
-    Only once terminate() holds the task queue's read lock: before that, an
-    idle worker may hold it, and killing that worker would leave the lock taken
-    for good. Until then terminate() is only waiting for that worker.
-    """
-    if stopped.wait(EVALUATION_POOL_STOP_TIMEOUT_SECONDS):
-        return
-    while not _task_queue_locked_by_us(pool):
-        if stopped.wait(0.5):
-            return
-    workers = [worker for worker in getattr(pool, "_pool", ()) if worker.is_alive()]
-    if not workers:
-        return
-    logger.warning(
-        "Evaluation workers {} did not stop within {} s; killing them.",
-        [worker.pid for worker in workers],
-        EVALUATION_POOL_STOP_TIMEOUT_SECONDS,
-    )
-    for worker in workers:
-        try:
-            worker.kill()
-        except (OSError, ValueError):
-            pass
+    @staticmethod
+    def Process(ctx: Any, *args: Any, **kwds: Any) -> Any:  # noqa: N802 - Pool API
+        process = ctx.Process(*args, **kwds)
+        setattr(process, "terminate", process.kill)
+        return process
 
 
 def _evaluation_worker(genome: list[int]) -> tuple[list[int], tuple[float], Any]:
@@ -3009,10 +2984,11 @@ class GeneticOptimization(OptimizationBase):
         cpus = worker_cpu_set(self._evaluation_workers) if self._pin_workers() else None
         _WORKER_OPTIMIZER = self
         try:
-            self._evaluation_pool = context.Pool(
+            self._evaluation_pool = _EvaluationPool(
                 self._evaluation_workers,
                 initializer=_evaluation_worker_init,
                 initargs=(cpus,),
+                context=context,
             )
         except Exception as exc:
             _WORKER_OPTIMIZER = None
@@ -3037,22 +3013,9 @@ class GeneticOptimization(OptimizationBase):
         pool = getattr(self, "_evaluation_pool", None)
         self._evaluation_pool = None
         _WORKER_OPTIMIZER = None
-        if pool is None:
-            return
-        # terminate() stops the workers with SIGTERM and waits for each of them.
-        # A worker that gets the signal before _evaluation_worker_init() has run
-        # (it started late on a busy machine) still has the server's handler and
-        # survives; the watchdog kills it, so the run does not hang.
-        stopped = threading.Event()
-        watchdog = threading.Thread(
-            target=_watch_pool_stop, args=(pool, stopped), name="eos-pool-stop", daemon=True
-        )
-        watchdog.start()
-        try:
+        if pool is not None:
             pool.terminate()
             pool.join()
-        finally:
-            stopped.set()
 
     def _fresh_population(self, count: int, *, educated_fraction: float) -> list[Any]:
         """Create a mixed set of current educated guesses and random immigrants."""
