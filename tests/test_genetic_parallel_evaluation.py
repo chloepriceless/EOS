@@ -287,6 +287,51 @@ def test_pool_stop_with_a_late_idle_worker_does_not_hang(server_signal_handlers)
     assert stopped, "stopping the pool hung"
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="needs Linux semaphores and /proc"
+)
+def test_pool_stop_never_kills_the_worker_holding_the_task_queue(
+    server_signal_handlers, monkeypatch
+):
+    """The idle worker that reads the task pipe holds the queue's read lock.
+
+    If it is paused past the stop timeout, killing it would leave the lock
+    taken for good and terminate() waiting for it forever. The stop has to
+    wait until the worker resumes, takes its sentinel and releases the lock.
+    """
+    monkeypatch.setattr(genetic_module, "EVALUATION_POOL_STOP_TIMEOUT_SECONDS", 1.0)
+    optimization = _PoolOnly.__new__(_PoolOnly)
+    optimization._start_evaluation_pool()
+    pool = optimization._evaluation_pool
+    assert pool is not None
+    pool.map(_square, range(20))
+    workers = list(pool._pool)
+    time.sleep(0.5)  # both idle: one reads the task pipe, one waits for its lock
+
+    def reads_task_pipe(worker) -> bool:
+        try:
+            with open(f"/proc/{worker.pid}/syscall") as syscall:
+                return syscall.read().split()[0] in ("0", "63")  # read x86_64/aarch64
+        except (OSError, IndexError):
+            return False
+
+    reader = next((worker for worker in workers if reads_task_pipe(worker)), None)
+    if reader is None:
+        _in_thread(optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool)))
+        pytest.skip("cannot tell which worker reads the task pipe")
+    os.kill(reader.pid, signal.SIGSTOP)
+    resume = threading.Timer(3.0, os.kill, (reader.pid, signal.SIGCONT))
+    resume.start()
+    try:
+        stopped = _in_thread(
+            optimization._stop_evaluation_pool, 30, lambda: _kill(list(pool._pool))
+        )
+    finally:
+        resume.join()
+    assert stopped, "stopping the pool hung"
+    assert reader.exitcode is not None and reader.exitcode != -signal.SIGKILL
+
+
 @pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
 def test_batch_timeout_under_server_signal_handlers_falls_back_to_serial(
     config_eos: ConfigEOS, monkeypatch, server_signal_handlers

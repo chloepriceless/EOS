@@ -303,8 +303,30 @@ def _evaluation_worker_init(cpus: Optional[set[int]] = None) -> None:
             pass
 
 
-def _kill_unstopped_workers(pool: Any) -> None:
-    """Kill the evaluation workers that are still running after Pool.terminate()."""
+def _task_queue_locked_by_us(pool: Any) -> bool:
+    """Whether this process holds the read lock of the pool's task queue.
+
+    In this process only Pool.terminate() takes that lock (and keeps it); the
+    workers take it in their own processes.
+    """
+    try:
+        return bool(pool._inqueue._rlock._semlock._count() > 0)
+    except (AttributeError, OSError):
+        return False
+
+
+def _watch_pool_stop(pool: Any, stopped: threading.Event) -> None:
+    """Kill the evaluation workers that Pool.terminate() could not stop.
+
+    Only once terminate() holds the task queue's read lock: before that, an
+    idle worker may hold it, and killing that worker would leave the lock taken
+    for good. Until then terminate() is only waiting for that worker.
+    """
+    if stopped.wait(EVALUATION_POOL_STOP_TIMEOUT_SECONDS):
+        return
+    while not _task_queue_locked_by_us(pool):
+        if stopped.wait(0.5):
+            return
     workers = [worker for worker in getattr(pool, "_pool", ()) if worker.is_alive()]
     if not workers:
         return
@@ -3020,18 +3042,17 @@ class GeneticOptimization(OptimizationBase):
         # terminate() stops the workers with SIGTERM and waits for each of them.
         # A worker that gets the signal before _evaluation_worker_init() has run
         # (it started late on a busy machine) still has the server's handler and
-        # survives; kill it, so the run does not hang. terminate() has taken the
-        # task queue's read lock long before, so no worker is killed holding it.
-        killer = threading.Timer(
-            EVALUATION_POOL_STOP_TIMEOUT_SECONDS, _kill_unstopped_workers, (pool,)
+        # survives; the watchdog kills it, so the run does not hang.
+        stopped = threading.Event()
+        watchdog = threading.Thread(
+            target=_watch_pool_stop, args=(pool, stopped), name="eos-pool-stop", daemon=True
         )
-        killer.daemon = True
-        killer.start()
+        watchdog.start()
         try:
             pool.terminate()
             pool.join()
         finally:
-            killer.cancel()
+            stopped.set()
 
     def _fresh_population(self, count: int, *, educated_fraction: float) -> list[Any]:
         """Create a mixed set of current educated guesses and random immigrants."""
