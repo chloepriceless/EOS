@@ -176,3 +176,26 @@ def test_ev_shift_mutation_without_planned_charging_changes_nothing(config_eos: 
 
     assert not optimizer._mutate_ev_shift(individual)
     assert individual == [0] * (2 * n)
+
+
+def test_ev_shift_mutation_ignores_genes_outside_the_rate_list(config_eos: ConfigEOS) -> None:
+    """A warm start from a run with more charge rates must not crash a mutation."""
+    configure(config_eos)
+    optimizer, _ = run(parameters())
+    n = optimizer.control_end_slot
+    individual = creator.Individual([0] * n + [10] * n)
+
+    random.seed(5)
+    assert not optimizer._mutate_ev_shift(individual)
+    assert individual == [0] * n + [10] * n
+    for _ in range(50):
+        optimizer._mutate_ev_controls(individual)
+
+
+def test_out_of_range_warm_start_does_not_abort_the_run(config_eos: ConfigEOS) -> None:
+    configure(config_eos)
+    params = parameters()
+    params.start_solution = [0.0] * SLOTS + [10.0] * SLOTS
+    _, solution = run(params)
+
+    assert solution.ev_charge_hours_float is not None
