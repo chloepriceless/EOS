@@ -2248,10 +2248,13 @@ class GeneticOptimization(OptimizationBase):
 
         offset = self.control_end_slot
         rates = self.ev_possible_charge_values
+        # A warm start from a run with other charge rates may carry indices
+        # outside the current rate list; those slots are left alone.
         charging = [
             slot
             for slot in range(start_slot, end_slot)
-            if rates[int(individual[offset + slot])] > 0.0
+            if 0 <= int(individual[offset + slot]) < len(rates)
+            and rates[int(individual[offset + slot])] > 0.0
         ]
         if not charging:
             return False
