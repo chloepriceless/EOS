@@ -2249,7 +2249,8 @@ class GeneticOptimization(OptimizationBase):
         offset = self.control_end_slot
         rates = self.ev_possible_charge_values
         # A warm start from a run with other charge rates may carry indices
-        # outside the current rate list; those slots are left alone.
+        # outside the current rate list. They are never looked up here and are
+        # not chosen as a source; a swap may still move them along.
         charging = [
             slot
             for slot in range(start_slot, end_slot)
