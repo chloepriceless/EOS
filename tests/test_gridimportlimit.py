@@ -44,6 +44,7 @@ from akkudoktoreos.optimization.genetic.geneticparams import (
     GeneticEnergyManagementParameters,
     GeneticOptimizationParameters,
 )
+from akkudoktoreos.optimization.genetic.geneticsolution import GeneticSolution
 from akkudoktoreos.optimization.genetic.tailvalue import (
     _simulate_action,
     build_tail_value_curve,
@@ -943,6 +944,125 @@ class TestOptimization:
 
         assert never_binding.ac_charge == unlimited.ac_charge
         assert never_binding.discharge_allowed == unlimited.discharge_allowed
+        assert never_binding.start_solution == unlimited.start_solution
+        assert never_binding.result.model_dump() == unlimited.result.model_dump()
+        assert never_binding.fitness_history == unlimited.fitness_history
+
+
+# ---------------------------------------------------------------------------
+# Together with the EV charge start and EV seeding of this branch
+# ---------------------------------------------------------------------------
+
+HOUSE_LIMIT_W = 29000.0
+EV_SLOTS = 24
+EV_ARRIVAL_SLOT = 8
+EV_DEADLINE_SLOT = 16
+CHEAP_EV_SLOTS = range(12, 16)
+
+
+def _optimize_house(
+    config_eos: ConfigEOS, limit_w: Optional[float], seed: int = 3
+) -> GeneticSolution:
+    """The 29 kW case as a run: battery 27 kW, EV 11 kW and 1 kW load want the same cheap hour.
+
+    Six quarter-hour hours. The EV arrives at 02:00 (slot 8) and needs 10.8 kWh
+    (18 % of 60 kWh, four full 11 kW slots) by 04:00 (slot 16); the cheapest
+    hour 03:00-04:00 is also where AC charging the empty battery for the 12 kW
+    evening load pays most.
+    """
+    config_eos.merge_settings_from_dict(
+        {
+            "prediction": {"hours": 48},
+            "optimization": {
+                "algorithm": "GENETIC",
+                "genetic": {
+                    "horizon_hours": 6,
+                    "tail_horizon_hours": 0,
+                    "interval_sec": 900,
+                    "terminal_value_mode": "FIXED",
+                    "terminal_value_euro_per_kwh": 0.0,
+                },
+            },
+            "feedintariff": {"direct_marketing_enabled": False},
+        }
+    )
+    get_ems(init=True).set_start_datetime(to_datetime("2026-11-05T00:00:00"))
+    prices = [0.0003] * EV_SLOTS
+    for slot in CHEAP_EV_SLOTS:
+        prices[slot] = 0.0001
+    for slot in range(16, EV_SLOTS):
+        prices[slot] = 0.0005
+    load = [250.0] * 16 + [3000.0] * 8
+    parameters = GeneticOptimizationParameters.model_validate(
+        {
+            "ems": {
+                "pv_forecast_wh": [0.0] * EV_SLOTS,
+                "total_load": load,
+                "electricity_price_per_wh": prices,
+                "feed_in_tariff_per_wh": 0.0,
+                "price_per_wh_battery": 0.0,
+            },
+            "pv_battery": {
+                "device_id": "battery1",
+                "capacity_wh": 60000,
+                "max_charge_power_w": 27000,
+                "charging_efficiency": 0.95,
+                "discharging_efficiency": 0.95,
+                "initial_soc_percentage": 5,
+                "min_soc_percentage": 5,
+                "charge_rates": [round(0.1 * i, 1) for i in range(11)],
+            },
+            "inverter": {
+                "device_id": "inverter1",
+                "max_power_wh": 30000,
+                "battery_id": "battery1",
+                "ac_to_dc_efficiency": 1.0,
+                "dc_to_ac_efficiency": 0.97,
+                "max_ac_charge_power_w": 27000,
+                "max_grid_import_power_w": limit_w,
+            },
+            "ev": {
+                "device_id": "car",
+                "capacity_wh": 60000,
+                "initial_soc_percentage": 0,
+                "min_soc_percentage": 18,
+                "max_soc_percentage": 100,
+                "charging_efficiency": 1.0,
+                "max_charge_power_w": 11000,
+                "charge_rates": [0.0, 0.5, 1.0],
+                "charge_start_datetime": "2026-11-05T02:00:00",
+                "min_soc_deadline_datetime": "2026-11-05T04:00:00",
+            },
+            "forecast_interval_seconds": 900,
+        }
+    )
+    return GeneticOptimization(fixed_seed=seed).optimize_ems(parameters, ngen=30, individuals=40)
+
+
+class TestWithEvChargeStart:
+    def test_ac_charge_and_ev_share_a_29_kw_connection(self, config_eos):
+        unlimited = _optimize_house(config_eos, None)
+        limited = _optimize_house(config_eos, HOUSE_LIMIT_W)
+
+        slot_limit_wh = HOUSE_LIMIT_W * 0.25
+        # Without the limit the plan draws 27 kW AC charge plus the EV on top.
+        assert max(unlimited.result.grid_consumption_wh_per_hour) > slot_limit_wh
+        assert max(limited.result.grid_consumption_wh_per_hour) <= slot_limit_wh + 1e-6
+        assert limited.ev_charge_hours_float is not None
+        # Nothing before the arrival; the EV still reaches its target in time.
+        assert not any(limited.ev_charge_hours_float[:EV_ARRIVAL_SLOT])
+        assert limited.result.ev_soc_per_hour[EV_DEADLINE_SLOT] >= 18.0 - 1e-6
+        # The battery still charges from the grid for the evening, only less per slot.
+        assert sum(limited.ac_charge[:EV_DEADLINE_SLOT]) > 0.0
+        assert any(0.0 < factor < 1.0 for factor in limited.ac_charge[:EV_DEADLINE_SLOT])
+
+    def test_without_limit_the_plan_is_unchanged_by_the_feature(self, config_eos):
+        """None and a limit above every import give bit-identical results with an EV."""
+        unlimited = _optimize_house(config_eos, None)
+        never_binding = _optimize_house(config_eos, 1e9)
+
+        assert never_binding.ev_charge_hours_float == unlimited.ev_charge_hours_float
+        assert never_binding.ac_charge == unlimited.ac_charge
         assert never_binding.start_solution == unlimited.start_solution
         assert never_binding.result.model_dump() == unlimited.result.model_dump()
         assert never_binding.fitness_history == unlimited.fitness_history
