@@ -237,7 +237,9 @@ class TestPeakShavingDischarge:
             discharging_efficiency=0.9,
             dc_to_ac_efficiency=0.95,
         )
-        subclassed = SubclassedBattery(battery.parameters, prediction_hours=SLOTS, slot_duration_h=0.25)
+        subclassed = SubclassedBattery(
+            battery.parameters, prediction_hours=SLOTS, slot_duration_h=0.25
+        )
         subclassed.reset()
         inverter.battery = subclassed
 
@@ -413,9 +415,7 @@ class TestGeneticSimulation:
         assert list(sim.ac_charge_hours) == [0.0, 0.0, 0.0]
 
     def test_ac_charge_is_filled_up_to_the_limit(self, config_eos):
-        result, sim = _simulate(
-            config_eos, load=[6000.0, 1000.0], ac=[1.0, 0.0], soc_percentage=0
-        )
+        result, sim = _simulate(config_eos, load=[6000.0, 1000.0], ac=[1.0, 0.0], soc_percentage=0)
 
         np.testing.assert_allclose(result["Netzbezug_Wh_pro_Stunde"], [8000.0, 1000.0])
         assert result["akku_soc_pro_stunde"][1] == pytest.approx(20.0)
@@ -654,7 +654,6 @@ class TestFitnessPenalty:
         fitness = _fitness(config_eos, result, sim.inverter)
 
         assert fitness == pytest.approx(result["Gesamtbilanz_Euro"] + 0.5725 * 10.0)
-
 
     @staticmethod
     def _fitness_with_break_even(
