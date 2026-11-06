@@ -348,6 +348,7 @@ def _simulate(
     dc: Optional[list[float]] = None,
     price: Optional[list[float]] = None,
     limit_w: Optional[float] = LIMIT_W,
+    ev_power_w: float = 7000.0,
     **device_kwargs: Any,
 ) -> tuple[dict[str, Any], GeneticSimulation]:
     config_eos.merge_settings_from_dict(
@@ -365,7 +366,7 @@ def _simulate(
                 capacity_wh=60000,
                 charging_efficiency=1.0,
                 discharging_efficiency=1.0,
-                max_charge_power_w=7000,
+                max_charge_power_w=ev_power_w,
                 initial_soc_percentage=0,
                 min_soc_percentage=100,
             ),
@@ -521,6 +522,38 @@ class TestGeneticSimulation:
         assert result["Netzbezug_Wh_pro_Stunde"][0] == pytest.approx(8000.0)
         assert sim.battery is not None
         assert result["akku_soc_pro_stunde"][1] == pytest.approx(70.0)
+
+    @pytest.mark.parametrize(
+        ("limit_w", "expected_import_wh", "expected_soc"),
+        [
+            # 1 kWh load + 11 kWh EV leave 17 kWh of the 29 kWh limit for the
+            # battery: 17 / 60 kWh = 28.33 %.
+            (29000.0, 29000.0, 17000 / 60000 * 100),
+            # Without a limit the full 27 kWh AC charge is drawn on top.
+            (None, 39000.0, 45.0),
+        ],
+    )
+    def test_ac_charge_gives_way_to_ev_charging_at_the_house_connection(
+        self, config_eos, limit_w, expected_import_wh, expected_soc
+    ):
+        """27 kW AC charging plus an 11 kW EV must not exceed a 29 kW connection."""
+        result, sim = _simulate(
+            config_eos,
+            load=[1000.0, 0.0],
+            ac=[1.0, 0.0],
+            ev_charge=[1.0, 0.0],
+            ev_power_w=11000.0,
+            limit_w=limit_w,
+            capacity_wh=60000,
+            soc_percentage=0,
+            battery_power_w=27000.0,
+            inverter_power_w=30000.0,
+        )
+
+        assert result["Netzbezug_Wh_pro_Stunde"][0] == pytest.approx(expected_import_wh)
+        assert result["akku_soc_pro_stunde"][1] == pytest.approx(expected_soc)
+        # EV charging is not cut: it keeps the 11 kWh the plan asked for.
+        assert result["EAuto_SoC_pro_Stunde"][1] == pytest.approx(11000 / 60000 * 100)
 
     def test_without_limit_the_load_is_imported(self, config_eos):
         result, _ = _simulate(
