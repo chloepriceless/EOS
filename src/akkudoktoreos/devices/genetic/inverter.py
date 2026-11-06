@@ -274,6 +274,13 @@ class Inverter:
         headroom_ac_wh = max_grid_import_wh - slot_grid_import_wh
         # The battery takes DC energy; the grid supplies it / ac_to_dc_efficiency.
         headroom_dc_wh = headroom_ac_wh * self.ac_to_dc_efficiency if headroom_ac_wh > 0.0 else 0.0
+        if (
+            not self.ac_charge_limits_total_charge
+            and battery.max_charge_power_w * self.slot_duration_h * factor <= headroom_dc_wh
+        ):
+            # Fast path: even the full rated charge fits (the budget never
+            # exceeds the rated charge energy of the slot).
+            return factor
         budget_wh = battery.remaining_charge_budget_wh(hour)
         if self.ac_charge_limits_total_charge:
             # The grid fills what PV left of the slot cap (factor x rated
