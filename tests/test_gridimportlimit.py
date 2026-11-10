@@ -29,6 +29,7 @@ from pydantic import ValidationError
 
 from akkudoktoreos.config.config import ConfigEOS
 from akkudoktoreos.core.coreabc import get_ems
+from akkudoktoreos.core.emplan import FRBCInstruction
 from akkudoktoreos.devices.genetic.battery import (
     Battery,
     ElectricVehicleParameters,
@@ -1333,3 +1334,221 @@ class TestWithPeriodicFullCharge:
         assert never_binding.start_solution == unlimited.start_solution
         assert never_binding.result.model_dump() == unlimited.result.model_dump()
         assert never_binding.fitness_history == unlimited.fitness_history
+
+
+# ---------------------------------------------------------------------------
+# The reported AC factor read as a share of the rated charge power
+# ---------------------------------------------------------------------------
+
+
+def _controller_grid_charge_wh(
+    factor: float,
+    rated_wh: float,
+    pv_charge_wh: float,
+    room_wh: float,
+    ac_to_dc_efficiency: float = 1.0,
+) -> float:
+    """AC energy an independent site controller draws for an AC charge factor.
+
+    The controller charges ``factor`` x the rated charge power from the grid;
+    the battery takes at most what PV left of its rated power and of its room.
+    """
+    dc_wh = min(factor * rated_wh, rated_wh - pv_charge_wh, room_wh)
+    return max(dc_wh, 0.0) / ac_to_dc_efficiency
+
+
+class TestExecutedAcFactor:
+    @pytest.mark.parametrize("ac_to_dc_efficiency", [1.0, 0.95])
+    @pytest.mark.parametrize("limit_w", [1000.0, 1500.0])
+    def test_lowered_factor_reproduces_the_grid_charge_at_rated_power(
+        self, config_eos, limit_w, ac_to_dc_efficiency
+    ):
+        """PV charges 3 kWh of the 5 kWh slot, the limit leaves 1 or 1.5 kWh for the grid.
+
+        The simulation applies its factor to the 2 kWh PV left. Reported as a
+        share of that budget (0.5 or 0.75), a controller charging factor x
+        5 kW would draw 2 kWh. Reported as a share of the rated 5 kWh it
+        draws exactly the simulated grid charge.
+        """
+        result, sim = _simulate(
+            config_eos,
+            load=[0.0],
+            pv=[3000.0],
+            ac=[1.0],
+            soc_percentage=20,
+            limit_w=limit_w,
+            ac_to_dc_efficiency=ac_to_dc_efficiency,
+        )
+
+        grid_wh = float(result["Netzbezug_Wh_pro_Stunde"][0])
+        assert grid_wh == pytest.approx(limit_w)
+        assert sim.ac_charge_hours is not None
+        factor = float(sim.ac_charge_hours[0])
+        assert factor == pytest.approx(limit_w * ac_to_dc_efficiency / 5000.0)
+        controller_wh = _controller_grid_charge_wh(
+            factor, 5000.0, 3000.0, 8000.0, ac_to_dc_efficiency
+        )
+        assert controller_wh == pytest.approx(grid_wh)
+
+    def test_factor_within_the_budget_is_reported_at_rated_power_too(self, config_eos):
+        """Gene 0.5 with 3 kWh PV: the simulation draws 0.5 x 2 kWh = 1 kWh, within 1.5 kW.
+
+        Read as 0.5 x 5 kW, a controller would draw the whole 2 kWh PV left and
+        exceed the limit. The reported 0.2 draws the simulated 1 kWh.
+        """
+        result, sim = _simulate(
+            config_eos, load=[0.0], pv=[3000.0], ac=[0.5], soc_percentage=20, limit_w=1500.0
+        )
+
+        grid_wh = float(result["Netzbezug_Wh_pro_Stunde"][0])
+        assert grid_wh == pytest.approx(1000.0)
+        assert sim.ac_charge_hours is not None
+        factor = float(sim.ac_charge_hours[0])
+        assert factor == pytest.approx(0.2)
+        assert _controller_grid_charge_wh(factor, 5000.0, 3000.0, 8000.0) == pytest.approx(grid_wh)
+
+    def test_factor_that_fits_at_rated_power_is_kept(self, config_eos):
+        """Gene 0.2 x 5 kW = 1 kWh fits the 1.5 kW limit: the factor stays as on main."""
+        _, sim = _simulate(
+            config_eos, load=[0.0], pv=[3000.0], ac=[0.2], soc_percentage=20, limit_w=1500.0
+        )
+
+        assert sim.ac_charge_hours is not None
+        assert float(sim.ac_charge_hours[0]) == 0.2
+
+    def test_total_charge_model_reports_the_total_cap(self, config_eos):
+        """The total-charge cap is PV plus grid: 3 kWh + 1 kWh of 5 kWh."""
+        result, sim = _simulate(
+            config_eos,
+            load=[0.0],
+            pv=[3000.0],
+            ac=[1.0],
+            soc_percentage=20,
+            limit_w=1000.0,
+            total_charge=True,
+        )
+
+        assert float(result["Netzbezug_Wh_pro_Stunde"][0]) == pytest.approx(1000.0)
+        assert sim.ac_charge_hours is not None
+        assert float(sim.ac_charge_hours[0]) == pytest.approx(0.8)
+
+    def test_charge_without_the_slot_import_is_rejected_with_a_limit(self):
+        inverter, _ = _devices(soc_percentage=0)
+
+        with pytest.raises(ValueError, match="slot_grid_import_wh"):
+            inverter.charge_battery_from_grid(0, 1.0)
+
+    def test_charge_without_a_limit_needs_no_slot_import(self):
+        inverter, battery = _devices(soc_percentage=0, limit_w=None)
+        battery.charge_array[0] = 1.0
+
+        assert inverter.charge_battery_from_grid(0, 1.0) == (5000.0, 0.0)
+
+
+class TestFitnessPenaltyEdges:
+    def test_limit_zero_penalises_every_import(self, config_eos):
+        """A limit of 0 W is a limit, not "no limit": 100 Wh excess at 10 EUR/kWh."""
+        inverter, _ = _devices(limit_w=0.0)
+
+        assert _fitness(config_eos, _result([100.0, 0.0]), inverter) == pytest.approx(1.5 + 1.0)
+
+    def test_rounding_above_the_limit_is_not_penalised(self, config_eos):
+        inverter, _ = _devices()
+
+        fitness = _fitness(config_eos, _result([8000.0 + 2e-12, 8000.0]), inverter)
+
+        assert fitness == 1.5
+
+
+def _optimize_pv_ac_slot(config_eos: ConfigEOS, seed: int = 42) -> GeneticSolution:
+    """Hourly: negative price and 3 kWh PV in the first hour, expensive load afterwards.
+
+    Grid charging pays in hour 0 while PV also charges the battery; the 1 kW
+    limit leaves 1 kWh for the grid there.
+    """
+    config_eos.merge_settings_from_dict(
+        {
+            "prediction": {"hours": 48},
+            "optimization": {
+                "algorithm": "GENETIC",
+                "genetic": {
+                    "horizon_hours": 4,
+                    "tail_horizon_hours": 0,
+                    "interval_sec": 3600,
+                    "terminal_value_mode": "FIXED",
+                    "terminal_value_euro_per_kwh": 0.0,
+                },
+            },
+            "feedintariff": {"direct_marketing_enabled": False},
+        }
+    )
+    get_ems(init=True).set_start_datetime(to_datetime("2026-10-26T00:00:00"))
+    parameters = GeneticOptimizationParameters.model_validate(
+        {
+            "ems": {
+                "pv_forecast_wh": [3000.0, 0.0, 0.0, 0.0],
+                "total_load": [0.0, 1000.0, 1000.0, 1000.0],
+                "electricity_price_per_wh": [-0.0001, 0.0006, 0.0006, 0.0006],
+                "feed_in_tariff_per_wh": 0.0,
+                "price_per_wh_battery": 0.0,
+            },
+            "pv_battery": {
+                "device_id": "battery1",
+                "capacity_wh": 10000,
+                "max_charge_power_w": 5000,
+                "charging_efficiency": 1.0,
+                "discharging_efficiency": 1.0,
+                "initial_soc_percentage": 20,
+                "min_soc_percentage": 0,
+            },
+            "inverter": {
+                "device_id": "inverter1",
+                "max_power_wh": 10000,
+                "battery_id": "battery1",
+                "ac_to_dc_efficiency": 1.0,
+                "dc_to_ac_efficiency": 1.0,
+                "max_grid_import_power_w": 1000.0,
+            },
+            "ev": None,
+            "forecast_interval_seconds": 3600,
+        }
+    )
+    return GeneticOptimization(fixed_seed=seed).optimize_ems(parameters, ngen=30, individuals=40)
+
+
+_MODE_CONTROLS = {
+    "IDLE": lambda f: (0.0, 0.0, 0.0),
+    "PEAK_SHAVING": lambda f: (0.0, 0.0, 1.0),
+    "SELF_CONSUMPTION": lambda f: (0.0, f, 1.0),
+    "NON_EXPORT": lambda f: (0.0, f, 0.0),
+    "GRID_SUPPORT_IMPORT": lambda f: (f, 0.0, 0.0),
+    "FORCED_CHARGE": lambda f: (f, 1.0, 0.0),
+}
+
+
+class TestExportedLoweredFactor:
+    def test_exported_factor_draws_the_simulated_grid_charge(self, config_eos):
+        """energy_management_plan() of a grid-limited AC slot with PV charging.
+
+        An independent controller charging factor x 5 kW from the grid next
+        to the 3 kWh PV charge imports what the simulation planned, 1 kWh.
+        """
+        solution = _optimize_pv_ac_slot(config_eos)
+        grid_wh = float(solution.result.grid_consumption_wh_per_hour[0])
+        assert grid_wh == pytest.approx(1000.0)
+        assert max(solution.result.grid_consumption_wh_per_hour) <= 1000.0 + 1e-6
+
+        start = get_ems().start_datetime
+        slot0 = [
+            instruction
+            for instruction in solution.energy_management_plan().instructions
+            if instruction.resource_id == "battery1" and instruction.execution_time == start
+        ]
+        assert len(slot0) == 1
+        instruction = slot0[0]
+        assert isinstance(instruction, FRBCInstruction)
+        ac, _, _ = _MODE_CONTROLS[str(instruction.operation_mode_id)](
+            float(instruction.operation_mode_factor)
+        )
+        assert ac == pytest.approx(0.2)
+        assert _controller_grid_charge_wh(ac, 5000.0, 3000.0, 8000.0) == pytest.approx(grid_wh)

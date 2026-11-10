@@ -9,7 +9,10 @@ import numpy as np
 from pydantic import PrivateAttr
 
 from akkudoktoreos.devices.genetic.battery import Battery
-from akkudoktoreos.devices.genetic.inverter import Inverter
+from akkudoktoreos.devices.genetic.inverter import (
+    GRID_IMPORT_LIMIT_TOLERANCE_WH,
+    Inverter,
+)
 from akkudoktoreos.optimization.genetic.terminalvalue import (
     TailPlanSlot,
     TerminalValueCurve,
@@ -88,7 +91,10 @@ def _simulate_action(
         sold * tariff - bought * price - (discharged_wh * bat.levelized_cost_of_storage_kwh / 1000)
     )
     max_grid_import_wh = inv.max_grid_import_wh
-    if max_grid_import_wh is not None and bought > max_grid_import_wh:
+    if (
+        max_grid_import_wh is not None
+        and bought > max_grid_import_wh + GRID_IMPORT_LIMIT_TOLERANCE_WH
+    ):
         reward -= (bought - max_grid_import_wh) * grid_import_penalty_euro_per_wh
     return {
         "next_state_wh": bat.soc_wh,

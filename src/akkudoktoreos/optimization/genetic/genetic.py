@@ -27,7 +27,10 @@ from akkudoktoreos.core.pydantic import PydanticBaseModel
 from akkudoktoreos.devices.devicesabc import ConsumerScheduleMode
 from akkudoktoreos.devices.genetic.battery import Battery
 from akkudoktoreos.devices.genetic.homeappliance import HomeAppliance
-from akkudoktoreos.devices.genetic.inverter import Inverter
+from akkudoktoreos.devices.genetic.inverter import (
+    GRID_IMPORT_LIMIT_TOLERANCE_WH,
+    Inverter,
+)
 from akkudoktoreos.optimization.genetic.geneticparams import (
     GeneticEnergyManagementParameters,
     GeneticOptimizationParameters,
@@ -889,24 +892,30 @@ class GeneticSimulation(PydanticBaseModel):
             if ac_charge_factor > 0.0 and battery_fast:
                 grid_limited = False
                 if inverter_fast:
-                    if max_grid_import_wh_fast is not None:
+                    if max_grid_import_wh_fast is None:
+                        ac_energy, ac_charge_losses = inverter_fast.charge_battery_from_grid(
+                            hour, ac_charge_factor
+                        )
+                    else:
                         # With a grid import limit, the charge only fills what
                         # the slot's import (load, EV) leaves of the limit. The
-                        # reported plan shows the factor that was simulated.
-                        limited_factor = inverter_fast.grid_limited_ac_charge_factor(
+                        # reported plan shows the factor a controller executes
+                        # to draw the simulated grid charge.
+                        (
+                            ac_energy,
+                            ac_charge_losses,
+                            executed_factor,
+                        ) = inverter_fast.charge_battery_from_grid_executed(
                             hour, ac_charge_factor, energy_consumption_grid_actual
                         )
-                        if limited_factor < ac_charge_factor:
+                        if executed_factor < ac_charge_factor:
                             grid_limited = True
-                            ac_charge_controls_fast[hour] = limited_factor
-                            if limited_factor <= 0.0 and dc_charge_hours_fast[hour] == 0:
+                            ac_charge_controls_fast[hour] = executed_factor
+                            if executed_factor <= 0.0 and dc_charge_hours_fast[hour] == 0:
                                 # The AC state let PV charge the battery in this
                                 # slot (direct marketing gives it dc_charge = 0).
                                 # Without its AC charge, the plan keeps that as DC.
                                 dc_charge_hours_fast[hour] = 1
-                    ac_energy, ac_charge_losses = inverter_fast.charge_battery_from_grid(
-                        hour, ac_charge_factor, slot_grid_import_wh=energy_consumption_grid_actual
-                    )
                 else:
                     # Without an inverter the grid charges the battery losslessly
                     # (AC-to-DC efficiency 1.0).
@@ -4161,15 +4170,12 @@ class GeneticOptimization(OptimizationBase):
         # what the battery actually delivered.
         max_grid_import_wh = getattr(self.simulation.inverter, "max_grid_import_wh", None)
         if max_grid_import_wh is not None:
-            excess_wh = float(
-                np.nansum(
-                    np.maximum(
-                        np.asarray(simulation_result["Netzbezug_Wh_pro_Stunde"], dtype=float)
-                        - max_grid_import_wh,
-                        0.0,
-                    )
-                )
+            excess = (
+                np.asarray(simulation_result["Netzbezug_Wh_pro_Stunde"], dtype=float)
+                - max_grid_import_wh
             )
+            # Rounding of a slot filled up to the limit is no excess.
+            excess_wh = float(np.sum(excess[excess > GRID_IMPORT_LIMIT_TOLERANCE_WH]))
             if excess_wh > 0.0:
                 gesamtbilanz += excess_wh * self._grid_import_limit_penalty_euro_per_wh()
 

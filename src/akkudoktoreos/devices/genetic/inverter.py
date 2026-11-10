@@ -13,6 +13,10 @@ from akkudoktoreos.devices.genetic.battery import Battery
 from akkudoktoreos.optimization.genetic.geneticdevices import DeviceParameters
 from akkudoktoreos.prediction.interpolator import get_eos_load_interpolator
 
+# Import above max_grid_import_power_w counts only beyond this margin [Wh]. A slot
+# filled up to the limit can land a few 1e-12 Wh above it by rounding.
+GRID_IMPORT_LIMIT_TOLERANCE_WH = 1e-6
+
 
 class InverterParameters(DeviceParameters):
     """Inverter Device Simulation Configuration."""
@@ -295,7 +299,7 @@ class Inverter:
         return headroom_dc_wh / budget_wh
 
     def charge_battery_from_grid(
-        self, hour: int, factor: float, slot_grid_import_wh: float = 0.0
+        self, hour: int, factor: float, slot_grid_import_wh: Optional[float] = None
     ) -> tuple[float, float]:
         """Charge the battery from the grid after PV was processed in this slot.
 
@@ -303,43 +307,100 @@ class Inverter:
         of the PV charge. With ``ac_charge_limits_total_charge`` the grid only
         fills what PV left of the slot cap set by ``begin_ac_charge_slot``.
 
-        With ``max_grid_import_power_w`` the factor is lowered by
-        ``grid_limited_ac_charge_factor`` so that the slot's grid import,
-        ``slot_grid_import_wh`` plus the charge, stays within the limit.
+        With ``max_grid_import_power_w`` the charge is lowered so that the
+        slot's grid import, ``slot_grid_import_wh`` plus the charge, stays
+        within the limit (see ``charge_battery_from_grid_executed``).
 
         Args:
             hour: Slot index.
             factor: AC charge factor of the slot.
             slot_grid_import_wh: Grid import of the slot without the AC charge
-                [Wh], as returned by ``process_energy``. Only used with a grid
+                [Wh], as returned by ``process_energy``. Required with a grid
                 import limit.
 
         Returns:
             tuple[float, float]: AC energy drawn from the grid [Wh] and the
             battery plus AC-to-DC conversion losses [Wh].
         """
-        if not self.battery or factor <= 0.0:
-            return 0.0, 0.0
-        if self.max_grid_import_wh is not None:
+        ac_energy, losses, _ = self.charge_battery_from_grid_executed(
+            hour, factor, slot_grid_import_wh
+        )
+        return ac_energy, losses
+
+    def charge_battery_from_grid_executed(
+        self, hour: int, factor: float, slot_grid_import_wh: Optional[float] = None
+    ) -> tuple[float, float, float]:
+        """Charge the battery from the grid and return the factor a controller executes.
+
+        Like ``charge_battery_from_grid``. With a grid import limit, the third
+        value is the AC charge factor that keeps a controller reading it as a
+        share of the battery's rated charge power within the limit:
+
+        - Default model: the simulation applies a factor to the charge budget
+          PV left in the slot, a controller to the rated power. Wherever
+          ``factor`` x rated charge energy would exceed the slot's headroom,
+          the reported factor is the DC energy the simulation drew from the
+          grid divided by the rated charge energy of the slot, so a controller
+          draws exactly the simulated grid charge, also when PV charged the
+          battery in the same slot. This applies whether or not the limit
+          lowered the simulated charge itself.
+        - ``ac_charge_limits_total_charge``: the factor is a total charge cap
+          (PV plus grid) in the simulation and on the inverter; when the limit
+          lowers it, the lowered cap is reported.
+
+        Otherwise the third value is ``factor`` unchanged.
+
+        Args:
+            hour: Slot index.
+            factor: AC charge factor of the slot.
+            slot_grid_import_wh: Grid import of the slot without the AC charge
+                [Wh], as returned by ``process_energy``. Required with a grid
+                import limit.
+
+        Returns:
+            tuple[float, float, float]: AC energy drawn from the grid [Wh], the
+            battery plus AC-to-DC conversion losses [Wh] and the executed factor.
+
+        Raises:
+            ValueError: A grid import limit is set but ``slot_grid_import_wh`` is not given.
+        """
+        battery = self.battery
+        if not battery or factor <= 0.0:
+            return 0.0, 0.0, factor
+        rated_wh = battery.max_charge_power_w * self.slot_duration_h
+        rated_reading_exceeds = False
+        max_grid_import_wh = self.max_grid_import_wh
+        if max_grid_import_wh is not None:
+            if slot_grid_import_wh is None:
+                raise ValueError(
+                    "slot_grid_import_wh is required with max_grid_import_power_w set."
+                )
+            # Would a controller charging factor x rated power exceed the headroom?
+            headroom_ac_wh = max_grid_import_wh - slot_grid_import_wh
+            headroom_dc_wh = (
+                headroom_ac_wh * self.ac_to_dc_efficiency if headroom_ac_wh > 0.0 else 0.0
+            )
+            rated_reading_exceeds = (
+                not self.ac_charge_limits_total_charge and rated_wh * factor > headroom_dc_wh
+            )
             limited_factor = self.grid_limited_ac_charge_factor(hour, factor, slot_grid_import_wh)
             if limited_factor <= 0.0:
-                return 0.0, 0.0
-            if limited_factor < factor and self.ac_charge_limits_total_charge:
-                self.battery.limit_slot_charge(
-                    hour, self.battery.max_charge_power_w * self.slot_duration_h * limited_factor
-                )
-            factor = limited_factor
+                return 0.0, 0.0, 0.0
+            if limited_factor < factor:
+                if self.ac_charge_limits_total_charge:
+                    battery.limit_slot_charge(hour, rated_wh * limited_factor)
+                factor = limited_factor
         if self.ac_charge_limits_total_charge:
-            stored, battery_losses = self.battery.charge_energy(
-                self.battery.max_charge_power_w * self.slot_duration_h * factor, hour
-            )
+            stored, battery_losses = battery.charge_energy(rated_wh * factor, hour)
         else:
-            stored, battery_losses = self.battery.charge_energy(None, hour, charge_factor=factor)
+            stored, battery_losses = battery.charge_energy(None, hour, charge_factor=factor)
         # DC energy entering the battery (before battery internal efficiency)
         dc_energy = stored + battery_losses
         # AC energy consumed from grid (accounts for AC->DC conversion loss)
         ac_energy = dc_energy / self.ac_to_dc_efficiency
-        return ac_energy, battery_losses + (ac_energy - dc_energy)
+        if rated_reading_exceeds:
+            factor = dc_energy / rated_wh if rated_wh > 0.0 else 0.0
+        return ac_energy, battery_losses + (ac_energy - dc_energy), factor
 
     def _delivered_ac_wh(
         self,

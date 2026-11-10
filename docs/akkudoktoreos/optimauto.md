@@ -223,7 +223,10 @@ The behavior of the genetic algorithm can be customized using the following conf
   Penalty in €/kWh for energy imported above the inverter's `max_grid_import_power_w`
   that the battery cannot shave. Only applies when that limit is set. The default `10.0` is far
   above any energy price, so the optimizer keeps reserve and charges earlier wherever the
-  battery can avoid the excess. The tail lookahead uses the same penalty.
+  battery can avoid the excess. The tail lookahead uses the same penalty. Against an EV target
+  the ranking depends on the vehicle: `ev_soc_miss` is charged per percentage point, so at the
+  defaults (10 per point and 10 €/kWh) the EV target wins for batteries below 100 kWh and the
+  limit wins above.
 :::
 
 #### Value Formats
@@ -332,7 +335,11 @@ The inverter supports separate AC↔DC conversion efficiencies:
   the simulation:
 
   1. reduces AC (grid) charging of the battery so that load plus charging stays within the
-     limit; the reported `ac_charge` of the slot is the reduced factor,
+     limit. Wherever the planned factor read as a share of the battery's rated charge power
+     (`max_charge_power_w`) would exceed the limit, the reported `ac_charge` of the slot is the
+     simulated grid charge as a share of the rated charge power, so a controller draws exactly
+     that, also when PV charges the battery in the same slot (with
+     `ac_charge_limits_total_charge`: the reduced total charge cap, PV included),
   2. lets the battery cover load above the limit within its discharge power, its minimum SoC
      and `max_power_w` - also in slots where the plan holds the battery, as the site
      controller that enforces the limit does,
