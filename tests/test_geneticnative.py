@@ -622,6 +622,17 @@ class TestCompareMode:
         assert solution.fixed_seed is not None
         assert solution.fixed_seed == optimization.fix_seed
 
+    @pytest.mark.parametrize("offset", ["+02:00", "+01:00"])
+    def test_start_in_the_repeated_dst_hour(self, config_eos, python_on_release_profile, offset):
+        """Both occurrences of 02:30 on 2026-10-25 (Europe/Berlin) run natively."""
+        _configure(config_eos, backend="compare", interval_sec=900, horizon_hours=12, tail_horizon_hours=6)
+        start = f"2026-10-25T02:30:00{offset}"
+        _run(_synthetic_input(slots=96, interval=900, seed=5), seed=4, start=start)
+        report = native.last_compare_report
+        assert report is not None
+        assert report.native_error == ""
+        assert report.identical, report.differences[:5]
+
     def test_native_failure_is_reported(self, config_eos):
         _configure(config_eos, backend="compare")
         data = _load_input("optimize_input_2.json").model_dump(mode="json")

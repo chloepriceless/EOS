@@ -529,7 +529,8 @@ def _use_python_timezones(optimization: GeneticOptimization, solution: GeneticSo
     """
     start = optimization.ems.start_datetime
     native_start = solution.start_solution_datetime
-    if native_start is None or native_start != start:
+    # Instants, not datetimes: across zones, Python never equates times in a DST fold.
+    if native_start is None or native_start.timestamp() != start.timestamp():
         raise NativeUnsupported(
             f"kernel solution starts at {native_start}, the energy management run at {start}"
         )
