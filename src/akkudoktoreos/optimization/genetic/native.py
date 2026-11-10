@@ -18,7 +18,8 @@ optimization (comments and docstrings ignored) and the package's ``certified.jso
 fingerprints to the behaviour switches of the kernel. Any change of those sources disables the
 native backend until the change is ported and the fingerprint certified; the ``compare`` CI job
 reports it. ``EOS_NATIVE_GENETIC_UNCERTIFIED=1`` lets an uncertified fingerprint run with the
-switches of EOS main - for that CI job only.
+switches of EOS main, ``=all`` with every switch the kernel knows (sources that carry the
+pending changes) - for that CI job and for certifying a branch only.
 
 Numerical profile
 -----------------
@@ -229,12 +230,13 @@ def _probe_status() -> NativeStatus:
     semantics = native.certified_semantics(fingerprint)
     if semantics is not None:
         return NativeStatus(True, "", version, dict(semantics), certified=True)
-    if os.environ.get(UNCERTIFIED_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+    uncertified = os.environ.get(UNCERTIFIED_ENV, "").strip().lower()
+    if uncertified in ("1", "true", "yes", "on", "all"):
         return NativeStatus(
             True,
             f"GENETIC sources {fingerprint} are not certified; {UNCERTIFIED_ENV} is set",
             version,
-            {name: False for name in native.SEMANTICS},
+            {name: uncertified == "all" for name in native.SEMANTICS},
             certified=False,
         )
     return NativeStatus(
@@ -603,15 +605,18 @@ def compare_solutions(python: GeneticSolution, native: GeneticSolution) -> list[
     )
 
 
-# With a bounded fitness cache, Python's hit/miss counters depend on the number of
-# evaluation workers (a batch looks up all genomes before it stores any); the kernel
-# counts like one worker. The plan does not depend on it.
+# With the fitness cache and more than one evaluation worker, Python's hit/miss counters
+# depend on the number of workers: a parallel batch looks up all genomes before it stores
+# any (bounded cache), and it evaluates identical genomes once even when the evaluation
+# failed, which a serial run does not cache. The kernel counts like one worker. The plan
+# does not depend on it.
 CACHE_COUNTERS = ".fitness_history.fitness_cache."
 
 
 def _counters_depend_on_workers(optimization: GeneticOptimization) -> bool:
     limit = optimization._genetic_cfg.fitness_cache_max_entries
-    return limit is not None and limit > 0 and optimization._configured_evaluation_workers() > 1
+    cache_enabled = limit is None or limit > 0
+    return cache_enabled and optimization._configured_evaluation_workers() > 1
 
 
 @dataclass

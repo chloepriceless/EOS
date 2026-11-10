@@ -6,8 +6,9 @@ plugin writes all reports to ``$GENETIC_COMPARE_OUT`` (JSON) and prints a summar
 
     PYTHONPATH=native/scripts pytest -p genetic_compare_plugin tests/test_genetic*.py
 
-``EOS_NATIVE_GENETIC_UNCERTIFIED=1`` is set, so the kernel also runs on sources that are not
-certified yet - that is the question this run answers.
+``EOS_NATIVE_GENETIC_UNCERTIFIED=1`` is set (unless already set, e.g. to ``all`` for sources
+with the pending changes), so the kernel also runs on sources that are not certified yet - that
+is the question this run answers.
 
 ``GENETIC_COMPARE_DOT=sequential`` makes the self-consumption interpolator's ``np.dot`` a
 sequential sum (``native.SequentialDotNumpy``; the rest of the Python code runs unchanged), so the kernel can reproduce Python on any CPU (needed on
@@ -35,7 +36,7 @@ RUN_INFO: dict[str, Any] = {}
 
 
 def pytest_configure(config: Any) -> None:
-    os.environ["EOS_NATIVE_GENETIC_UNCERTIFIED"] = "1"
+    os.environ.setdefault("EOS_NATIVE_GENETIC_UNCERTIFIED", "1")
     from unittest import mock
 
     from akkudoktoreos.optimization.genetic import genetic as genetic_module
@@ -54,8 +55,22 @@ def pytest_configure(config: Any) -> None:
         "_evaluation_worker_init": genetic_module._evaluation_worker_init,
     }
 
+    # Methods of the optimizer and the simulation as the session starts: a test that replaces
+    # one (monkeypatch.setattr on the class) runs other Python than the kernel reproduces.
+    from akkudoktoreos.optimization.genetic.genetic import GeneticSimulation
+
+    pristine_methods = {
+        (cls, name): value
+        for cls in (GeneticOptimization, GeneticSimulation)
+        for name, value in vars(cls).items()
+        if (callable(value) or isinstance(value, (staticmethod, classmethod)))
+        and name != "optimize_ems"  # replaced by this plugin below
+    }
+
     def patched(self: Any) -> bool:
         if isinstance(getattr(self, "optimize", None), mock.Mock):
+            return True
+        if any(vars(cls).get(name) is not value for (cls, name), value in pristine_methods.items()):
             return True
         return any(getattr(genetic_module, name) is not fn for name, fn in pristine.items() if name != "optimize")
 

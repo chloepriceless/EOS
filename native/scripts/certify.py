@@ -23,7 +23,6 @@ CERTIFIED = (
     / "akkudoktoreos_native"
     / "certified.json"
 )
-SEMANTICS = ("neutral_dc_permission", "executed_ac_controls", "ev_charge_seeding")
 
 
 def main() -> int:
@@ -52,12 +51,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    wanted = {name: args.semantics == "all" for name in SEMANTICS}
+    import akkudoktoreos_native
+
+    wanted = {name: args.semantics == "all" for name in akkudoktoreos_native.SEMANTICS}
     if summary.get("semantics") != wanted:
         print(f"refusing: the report ran with {summary.get('semantics')}, not {wanted}", file=sys.stderr)
         return 1
-    import akkudoktoreos_native
-
     if summary.get("kernel_version") != akkudoktoreos_native.__version__:
         print(
             f"refusing: the report used kernel {summary.get('kernel_version')}, "
