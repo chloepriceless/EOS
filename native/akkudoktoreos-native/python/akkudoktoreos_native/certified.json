@@ -8,9 +8,10 @@
         "executed_ac_controls": false,
         "ev_charge_seeding": false
       },
+      "kernel_version": "0.1.0",
       "verified": "2026-11-10",
-      "evidence": "93 identical runs, 22 not supported natively, 14 with patched Python, 0 different",
-      "note": "Akkudoktor-EOS main 7767028 + native GENETIC backend; compare on linux/aarch64 (Neoverse N1 profile and sequential dot)"
+      "evidence": "56 identical runs, 23 not supported natively, 14 with patched Python, 0 different (dot: sequential)",
+      "note": "Akkudoktor-EOS main 7767028 + native GENETIC backend; GENETIC test suite in compare mode on linux/aarch64, Neoverse N1 profile and sequential dot"
     }
   ]
 }

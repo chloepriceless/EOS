@@ -34,7 +34,7 @@ from akkudoktoreos.optimization.genetic.geneticsettings import (
     GeneticCommonSettings,
 )
 from akkudoktoreos.optimization.genetic.geneticsolution import GeneticSolution
-from akkudoktoreos.prediction.interpolator import SelfConsumptionProbabilityInterpolator
+from akkudoktoreos.prediction import interpolator as interpolator_module
 from akkudoktoreos.utils.datetimeutil import to_datetime
 
 DIR_TESTDATA = Path(__file__).parent / "testdata" / "genetic"
@@ -78,11 +78,7 @@ def python_on_release_profile(monkeypatch, config_eos):
         x = rng.uniform(xp[0], xp[-1])
         if float(np.interp(x, xp, fp)) != kernel.interp(x, xp, fp, False):
             pytest.skip("this NumPy fuses multiply-add in np.interp; no release-profile reference")
-    monkeypatch.setattr(
-        SelfConsumptionProbabilityInterpolator,
-        "_expected_direct_consumption",
-        native.expected_direct_consumption_release_profile,
-    )
+    monkeypatch.setattr(interpolator_module, "np", native.SequentialDotNumpy())
     config_eos.merge_settings_from_dict({"optimization": {"self_consumption_interpolator": "numpy"}})
     CacheEnergyManagementStore().clear()
 
@@ -418,6 +414,23 @@ class TestFallback:
                 parameters=_load_input("optimize_input_1.json"), start_hour=3, ngen=2
             )
 
+    def test_broken_package_falls_back_to_python(self, config_eos, monkeypatch):
+        _configure(config_eos)
+        reference = _run(_load_input("optimize_input_1.json"), ngen=3)
+
+        class Broken(_FakeKernel):
+            def certified_semantics(self, fingerprint: str) -> Optional[dict[str, bool]]:
+                raise ValueError("certified.json is broken")
+
+        monkeypatch.setattr(native, "_import_native", lambda: Broken(**vars(_fake_kernel())))
+        status = native.native_status()
+        assert not status.available and "unusable" in status.reason
+        for backend in ("native", "compare"):
+            native.reset_status_cache()
+            _set_backend(config_eos, backend)
+            solution = _run(_load_input("optimize_input_1.json"), ngen=3)
+            assert native.compare_solutions(reference, solution) == []
+
     def test_request_without_nan_and_infinity(self):
         assert native._json_ready({"a": [1.0, math.nan, 2]}) == {"a": [1.0, None, 2]}
         with pytest.raises(native.NativeUnsupported):
@@ -549,6 +562,16 @@ class TestNativeEqualsPython:
         )
         assert native.compare_solutions(python, native_solution) == []
 
+    def test_battery_without_inverter_falls_back(self, config_eos):
+        _configure(config_eos)
+        data = _load_input("optimize_input_1.json").model_dump(mode="json")
+        data["inverter"] = None
+
+        python, native_solution = _run_both(
+            config_eos, lambda: GeneticOptimizationParameters(**data)
+        )
+        assert native.compare_solutions(python, native_solution) == []
+
     def test_unsupported_request_falls_back(self, config_eos):
         _configure(config_eos)
         data = _load_input("optimize_input_2.json").model_dump(mode="json")
@@ -585,6 +608,19 @@ class TestCompareMode:
         assert report is not None and report.native_error == ""
         if report.profile_reproduces_python:
             assert report.identical, report.differences[:5]
+
+    def test_without_seed_both_runs_share_one(self, config_eos, python_on_release_profile):
+        _configure(config_eos, backend="compare")
+        get_ems().set_start_datetime(to_datetime(START, in_timezone="Europe/Berlin"))
+        CacheEnergyManagementStore().clear()
+        optimization = GeneticOptimization()
+        assert GeneticOptimization().fix_seed is None
+        solution = optimization.optimize_ems(parameters=_load_input("optimize_input_2.json"))
+        report = native.last_compare_report
+        assert report is not None
+        assert report.identical, report.differences[:5]
+        assert solution.fixed_seed is not None
+        assert solution.fixed_seed == optimization.fix_seed
 
     def test_native_failure_is_reported(self, config_eos):
         _configure(config_eos, backend="compare")

@@ -190,11 +190,20 @@ def reset_status_cache() -> None:
 
 
 def native_status() -> NativeStatus:
-    """Status of the native backend for this process (cached)."""
+    """Status of the native backend for this process (cached).
+
+    Never raises: an unusable package (broken ``certified.json``, missing symbols) is a reason
+    to run Python, not a failed optimization.
+    """
     global _status_cache
     with _status_lock:
         if _status_cache is None:
-            _status_cache = _probe_status()
+            try:
+                _status_cache = _probe_status()
+            except Exception as exc:  # noqa: BLE001 - any defect of the optional package
+                _status_cache = NativeStatus(
+                    False, f"{NATIVE_PACKAGE} is unusable: {type(exc).__name__}: {exc}"
+                )
         return _status_cache
 
 
@@ -264,28 +273,23 @@ def sequential_dot(a: Any, b: Any) -> float:
     return total
 
 
-def expected_direct_consumption_release_profile(
-    interpolator: Any, mean_load_power_w: float, pv_power_w: float
-) -> float:
-    """``SelfConsumptionProbabilityInterpolator._expected_direct_consumption`` on the release profile.
+class SequentialDotNumpy:
+    """NumPy with :func:`sequential_dot` as ``dot`` - for verification only.
 
-    The same computation with :func:`sequential_dot` instead of ``np.dot``. Patched in by the
-    tests (and the compare CI job) so that Python and the kernel's release profile must agree
-    bit for bit on every CPU.
+    Installed as ``akkudoktoreos.prediction.interpolator.np`` by the tests and the compare CI
+    job: the live Python code keeps running, only its BLAS dot product sums in the order of the
+    release profile, so Python and the kernel must agree bit for bit on every CPU.
     """
-    mean_load_power_w = max(float(mean_load_power_w), 0.0)
-    pv_power_w = max(float(pv_power_w), 0.0)
-    if mean_load_power_w == 0.0 or pv_power_w == 0.0:
-        return 0.0
-    load_levels_w, probabilities = interpolator._load_distribution(mean_load_power_w)
-    modeled_mean_load_w = sequential_dot(probabilities, load_levels_w)
-    if modeled_mean_load_w <= 0.0:
-        return 0.0
-    normalized_load_levels_w = load_levels_w * (mean_load_power_w / modeled_mean_load_w)
-    expected_direct_power_w = sequential_dot(
-        probabilities, np.minimum(normalized_load_levels_w, pv_power_w)
-    )
-    return min(max(expected_direct_power_w, 0.0), min(mean_load_power_w, pv_power_w))
+
+    def __init__(self, numpy_module: Any = np) -> None:
+        self._numpy = numpy_module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._numpy, name)
+
+    @staticmethod
+    def dot(a: Any, b: Any) -> float:
+        return sequential_dot(a, b)
 
 
 _reference_profile_cache: dict[str, Optional[dict[str, Any]]] = {}
@@ -679,8 +683,19 @@ def optimize_ems(
 
     # COMPARE
     global last_compare_report
-    profile = reference_profile()
+    try:
+        profile = reference_profile()
+    except Exception as exc:  # noqa: BLE001 - the probe must not stop the Python run
+        logger.warning("GENETIC compare: numerical profile probe failed: {}", exc)
+        profile = None
     reproduces = profile is not None
+    if optimization.fix_seed is None:
+        # Both runs need the same random numbers to be comparable; Python reseeds from
+        # fix_seed at the start of optimize().
+        optimization.fix_seed = random.SystemRandom().randint(1, 100000000000)
+        logger.info(
+            "GENETIC compare: no seed configured, both runs use seed {}.", optimization.fix_seed
+        )
     native_run: Optional[NativeRun] = None
     native_error = ""
     try:

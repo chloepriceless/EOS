@@ -45,16 +45,38 @@ def main() -> int:
         return 1
 
     fingerprint = compute_fingerprint()
+    if summary.get("fingerprint") != fingerprint:
+        print(
+            f"refusing: the report was made for {summary.get('fingerprint')}, "
+            f"the sources are {fingerprint}",
+            file=sys.stderr,
+        )
+        return 1
+    wanted = {name: args.semantics == "all" for name in SEMANTICS}
+    if summary.get("semantics") != wanted:
+        print(f"refusing: the report ran with {summary.get('semantics')}, not {wanted}", file=sys.stderr)
+        return 1
+    import akkudoktoreos_native
+
+    if summary.get("kernel_version") != akkudoktoreos_native.__version__:
+        print(
+            f"refusing: the report used kernel {summary.get('kernel_version')}, "
+            f"installed is {akkudoktoreos_native.__version__}",
+            file=sys.stderr,
+        )
+        return 1
     data = json.loads(CERTIFIED.read_text(encoding="utf-8"))
     entries = [e for e in data["entries"] if e["fingerprint"] != fingerprint]
     entries.append(
         {
             "fingerprint": fingerprint,
-            "semantics": {name: args.semantics == "all" for name in SEMANTICS},
+            "semantics": wanted,
+            "kernel_version": summary["kernel_version"],
             "verified": dt.date.today().isoformat(),
             "evidence": (
                 f"{summary['identical']} identical runs, {summary['unsupported']} not supported "
-                f"natively, {summary['patched']} with patched Python, 0 different"
+                f"natively, {summary['patched']} with patched Python, 0 different "
+                f"(dot: {summary.get('dot')})"
             ),
             "note": args.note,
         }

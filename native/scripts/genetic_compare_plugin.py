@@ -9,13 +9,17 @@ plugin writes all reports to ``$GENETIC_COMPARE_OUT`` (JSON) and prints a summar
 ``EOS_NATIVE_GENETIC_UNCERTIFIED=1`` is set, so the kernel also runs on sources that are not
 certified yet - that is the question this run answers.
 
-``GENETIC_COMPARE_DOT=sequential`` replaces the BLAS dot product of the self-consumption
-interpolator with a sequential sum, so the kernel can reproduce Python on any CPU (needed on
+``GENETIC_COMPARE_DOT=sequential`` makes the self-consumption interpolator's ``np.dot`` a
+sequential sum (``native.SequentialDotNumpy``; the rest of the Python code runs unchanged), so the kernel can reproduce Python on any CPU (needed on
 x86-64, whose OpenBLAS kernels the kernel does not reproduce). Without it, compare uses the
 profile it detects and only CPUs with a known kernel (e.g. Neoverse N1, Cortex-A53/A55) give
 bit-identical results. Tests that replace parts of the Python
 optimizer (``patch.object(opt, "optimize", ...)``, broken worker pools) differ by design; they
-are listed under ``patched``.
+are listed under ``patched``. ``tests/test_geneticnative.py`` selects backends itself and is left
+alone.
+
+The summary records the fingerprint of the GENETIC sources, the kernel version and the
+behaviour switches it ran with; ``certify.py`` certifies exactly that.
 """
 
 from __future__ import annotations
@@ -25,6 +29,9 @@ import os
 from typing import Any
 
 REPORTS: list[dict[str, Any]] = []
+# Tests that choose the backend themselves.
+SELF_MANAGED = "tests/test_geneticnative.py"
+RUN_INFO: dict[str, Any] = {}
 
 
 def pytest_configure(config: Any) -> None:
@@ -37,13 +44,9 @@ def pytest_configure(config: Any) -> None:
 
     native.reset_status_cache()
     if os.environ.get("GENETIC_COMPARE_DOT", "") == "sequential":
-        from akkudoktoreos.prediction.interpolator import (
-            SelfConsumptionProbabilityInterpolator,
-        )
+        from akkudoktoreos.prediction import interpolator
 
-        SelfConsumptionProbabilityInterpolator._expected_direct_consumption = (  # type: ignore[method-assign]
-            native.expected_direct_consumption_release_profile
-        )
+        interpolator.np = native.SequentialDotNumpy()  # type: ignore[assignment]
     original = GeneticOptimization.optimize_ems
     pristine = {
         "optimize": GeneticOptimization.optimize,
@@ -58,6 +61,8 @@ def pytest_configure(config: Any) -> None:
 
     def optimize_ems(self: Any, parameters: Any, start_hour: Any = None, worst_case: bool = False,
                      ngen: Any = None, individuals: Any = None) -> Any:
+        if os.environ.get("PYTEST_CURRENT_TEST", "").startswith(SELF_MANAGED):
+            return original(self, parameters, start_hour, worst_case, ngen, individuals)
         cfg = self.config.optimization.genetic
         backend = cfg.backend
         cfg.backend = "compare"
@@ -67,6 +72,11 @@ def pytest_configure(config: Any) -> None:
         finally:
             cfg.backend = backend
             report = native.last_compare_report
+            status = native.native_status()
+            RUN_INFO.setdefault("fingerprint", native.source_fingerprint())
+            RUN_INFO.setdefault("kernel_version", status.version)
+            RUN_INFO.setdefault("semantics", status.semantics)
+            RUN_INFO.setdefault("dot", os.environ.get("GENETIC_COMPARE_DOT", "") or "detected")
             REPORTS.append({
                 "test": os.environ.get("PYTEST_CURRENT_TEST", "?").rsplit(" ", 1)[0],
                 "patched": patched(self),
@@ -91,7 +101,7 @@ def pytest_configure(config: Any) -> None:
 def summarize(reports: list[dict[str, Any]]) -> dict[str, Any]:
     """Counts per outcome; ``different`` lists the unpatched runs that differ."""
     summary: dict[str, Any] = {"runs": len(reports), "identical": 0, "unsupported": 0,
-                               "patched": 0, "no_report": 0, "different": []}
+                               "patched": 0, "no_report": 0, "different": [], **RUN_INFO}
     for entry in reports:
         report = entry["report"]
         if report is None:
@@ -116,7 +126,8 @@ def pytest_unconfigure(config: Any) -> None:
     print(
         "\nGENETIC compare: {runs} runs, {identical} identical, {unsupported} not supported natively, "
         "{patched} with patched Python, {no_report} without report, {n} different".format(
-            n=len(summary["different"]), **{k: v for k, v in summary.items() if k != "different"}
+            n=len(summary["different"]),
+            **{k: summary[k] for k in ("runs", "identical", "unsupported", "patched", "no_report")},
         )
     )
     for entry in summary["different"]:
