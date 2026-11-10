@@ -512,7 +512,29 @@ def run_native(
     data = response["solution"]
     data["parameters"] = _solution_parameters(optimization, parameters)
     solution = GeneticSolution(**data)
+    _use_python_timezones(optimization, solution)
     return NativeRun(solution, response.get("diagnostics", {}), elapsed)
+
+
+def _use_python_timezones(optimization: GeneticOptimization, solution: GeneticSolution) -> None:
+    """Give the solution's timestamps the timezone objects Python uses.
+
+    JSON carries only UTC offsets, which validate into fixed-offset zones; the plan and the
+    solution data frames need the named zones ``_optimize_ems_run`` uses: the EMS start for
+    ``start_solution_datetime`` and ``general.timezone`` for the appliance starts.
+    """
+    start = optimization.ems.start_datetime
+    native_start = solution.start_solution_datetime
+    if native_start is None or native_start != start:
+        raise NativeUnsupported(
+            f"kernel solution starts at {native_start}, the energy management run at {start}"
+        )
+    solution.start_solution_datetime = start
+    timezone = optimization.config.general.timezone
+    solution.appliance_starts = {
+        device_id: [moment.in_timezone(timezone) for moment in starts]
+        for device_id, starts in solution.appliance_starts.items()
+    }
 
 
 # --------------------------------------------------------------------------- comparison
@@ -555,9 +577,25 @@ def diff_values(
     return out
 
 
+def _timezone_names(solution: GeneticSolution) -> dict[str, Any]:
+    def name(moment: Any) -> Optional[str]:
+        return None if moment is None else _timezone_name(moment)
+
+    return {
+        "start_solution_datetime": name(solution.start_solution_datetime),
+        "appliance_starts": {
+            device_id: [name(moment) for moment in starts]
+            for device_id, starts in solution.appliance_starts.items()
+        },
+    }
+
+
 def compare_solutions(python: GeneticSolution, native: GeneticSolution) -> list[str]:
-    """Differences between two solutions (``model_dump`` paths)."""
-    return diff_values(python.model_dump(mode="json"), native.model_dump(mode="json"))
+    """Differences between two solutions (``model_dump`` paths, and timezones of timestamps)."""
+    differences = diff_values(python.model_dump(mode="json"), native.model_dump(mode="json"))
+    return differences + diff_values(
+        _timezone_names(python), _timezone_names(native), path=".<timezone>"
+    )
 
 
 # With a bounded fitness cache, Python's hit/miss counters depend on the number of

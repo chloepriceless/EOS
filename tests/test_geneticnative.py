@@ -471,6 +471,33 @@ class TestNativeEqualsPython:
         if direct_marketing:
             assert native_solution.battery_grid_export_factor
 
+    @pytest.mark.asyncio
+    async def test_plan_and_solution_frames(self, config_eos):
+        """The native solution yields the same plan and solution frames as Python's."""
+        _configure(config_eos, interval_sec=900, horizon_hours=24, tail_horizon_hours=12)
+
+        def make() -> GeneticOptimizationParameters:
+            return _synthetic_input(slots=192, interval=900, seed=11, appliance=True)
+
+        python, native_solution = _run_both(config_eos, make, seed=9)
+        assert native.compare_solutions(python, native_solution) == []
+        python_frames = (await python.optimization_solution()).model_dump(mode="json")
+        native_frames = (await native_solution.optimization_solution()).model_dump(mode="json")
+        for frames in (python_frames, native_frames):
+            frames.pop("generated_at", None)
+            frames.pop("id", None)
+        assert native.diff_values(python_frames, native_frames) == []
+
+        def plan(solution: GeneticSolution) -> dict[str, Any]:
+            dump = solution.energy_management_plan().model_dump(mode="json")
+            dump.pop("generated_at", None)
+            dump.pop("id", None)
+            for instruction in dump["instructions"]:
+                instruction.pop("id", None)
+            return dump
+
+        assert native.diff_values(plan(python), plan(native_solution)) == []
+
     @pytest.mark.parametrize("dated", [False, True])
     def test_warm_start_from_previous_run(self, config_eos, dated):
         """A warm start from an earlier run, shifted by the elapsed slots when it is dated."""
