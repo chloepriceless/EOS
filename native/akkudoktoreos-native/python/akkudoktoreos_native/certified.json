@@ -1,4 +1,16 @@
 {
   "format": 1,
-  "entries": []
+  "entries": [
+    {
+      "fingerprint": "sha256:add0598d6e82361a3d16884c8792b84d499bb11ac4b9f4b17a4bccfbf380ca6d",
+      "semantics": {
+        "neutral_dc_permission": false,
+        "executed_ac_controls": false,
+        "ev_charge_seeding": false
+      },
+      "verified": "2026-11-10",
+      "evidence": "93 identical runs, 22 not supported natively, 14 with patched Python, 0 different",
+      "note": "Akkudoktor-EOS main 7767028 + native GENETIC backend; compare on linux/aarch64 (Neoverse N1 profile and sequential dot)"
+    }
+  ]
 }
