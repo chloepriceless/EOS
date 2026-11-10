@@ -70,7 +70,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("INTERFACE_VERSION", eos_genetic::run::INTERFACE_VERSION)?;
     m.add("SELF_CONSUMPTION_TABLE_SHA256", eos_genetic::selfconsumption::SOURCE_SHA256)?;
     m.add("DOT_KERNELS", vec!["sequential", "cortexa53", "neoversen1"])?;
-    m.add("SEMANTICS", vec!["neutral_dc_permission", "executed_ac_controls", "ev_charge_seeding"])?;
+    m.add(
+        "SEMANTICS",
+        vec!["neutral_dc_permission", "executed_ac_controls", "ev_charge_seeding", "threshold_peak_shaving"],
+    )?;
     m.add("NativeRunError", m.py().get_type::<NativeRunError>())?;
     m.add_function(wrap_pyfunction!(run_genetic, m)?)?;
     m.add_function(wrap_pyfunction!(dot, m)?)?;

@@ -7,7 +7,7 @@
 use crate::devices::battery::{Battery, BatterySpec, SimError};
 use crate::devices::homeappliance::{ApplianceGene, HomeAppliance, StartDecoder};
 use crate::devices::inverter::{GRID_IMPORT_LIMIT_TOLERANCE_WH, Inverter};
-use crate::numpy::{self, DotKernel, NumericProfile, py_max};
+use crate::numpy::{self, DotKernel, NumericProfile, py_max, py_min};
 use crate::selfconsumption::SelfConsumption;
 use crate::settings::Semantics;
 
@@ -67,8 +67,38 @@ pub struct FullCharge {
 #[derive(Debug, Clone)]
 pub struct EvPenalty {
     pub penalty: f64,
+    /// `parameters.ev.min_soc_percentage`, also the target `_ev_soc_value_credit` starts at.
     pub min_soc: f64,
     pub deadline_slot: Option<i64>,
+    /// `_ev_soc_value_steps` (non-empty), credited above the target.
+    pub soc_value_steps: Option<Vec<(f64, f64)>>,
+}
+
+impl EvPenalty {
+    /// `_ev_soc_value_credit(soc_percentage)`: credit for the EV energy above the target.
+    ///
+    /// Each kWh between the target and a step's SoC earns that step's amount; energy below the
+    /// target, above the last step or above the maximum SoC earns nothing.
+    pub fn soc_value_credit(&self, ev: &Battery, soc_percentage: f64) -> f64 {
+        let Some(steps) = self.soc_value_steps.as_deref() else {
+            return 0.0;
+        };
+        let kwh_per_percent = ev.s.capacity_wh / 100.0 / 1000.0;
+        let mut lower = self.min_soc;
+        let top = py_min(soc_percentage, ev.s.max_soc_percentage);
+        let mut credit = 0.0;
+        for &(step_soc, amount) in steps {
+            if lower >= top {
+                break;
+            }
+            let upper = py_min(step_soc, top);
+            if upper > lower {
+                credit += (upper - lower) * kwh_per_percent * amount;
+            }
+            lower = py_max(lower, step_soc);
+        }
+        credit
+    }
 }
 
 /// Everything an evaluation needs that does not change during the run.
@@ -597,6 +627,11 @@ impl Evaluator {
             };
             if ev_soc < evp.min_soc {
                 gesamtbilanz += (evp.min_soc - ev_soc).abs() * evp.penalty;
+            }
+            // Energy above the target is worth what the caller says it saves later, at the same
+            // moment the target is checked.
+            if evp.soc_value_steps.is_some() {
+                gesamtbilanz -= evp.soc_value_credit(e, ev_soc);
             }
         }
         Evaluation { fitness: gesamtbilanz, extra: Some(extra) }

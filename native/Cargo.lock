@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "akkudoktoreos-native"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eos-genetic",
  "pyo3",
@@ -76,7 +76,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "eos-genetic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "chrono-tz",

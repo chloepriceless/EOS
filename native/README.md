@@ -38,10 +38,22 @@ The kernel is a port; Python is the reference. `native.source_fingerprint()` has
 files that define a GENETIC run (comments and docstrings ignored) plus the self-consumption
 table. The package's `certified.json` lists the fingerprints it was verified against, with the
 behaviour switches the kernel needs for them (`neutral_dc_permission`, `executed_ac_controls`,
-`ev_charge_seeding` – ports of changes still under review upstream; all off for main). Any change
-of those sources disables `native` until the port follows and the new fingerprint is certified.
-`EOS_NATIVE_GENETIC_UNCERTIFIED=1` runs uncertified sources with main's switches – meant for the
-compare CI job, which answers exactly that question.
+`ev_charge_seeding`, `threshold_peak_shaving` – ports of changes still under review upstream; all
+off for main). Any change of those sources disables `native` until the port follows and the new
+fingerprint is certified. `EOS_NATIVE_GENETIC_UNCERTIFIED=1` runs uncertified sources with main's
+switches – meant for the compare CI job, which answers exactly that question; `=all` runs them
+with every switch on (sources that carry all pending changes, e.g. a deployment branch).
+
+Inputs of pending changes need no switch: they only exist in sources that have the change, and the
+kernel follows the version of these pull requests:
+
+- `inverter.max_grid_import_power_w` (grid import limit): AC charging is reduced to the limit;
+  with `threshold_peak_shaving` a battery the plan holds still covers the import above it (the
+  plan's battery instructions then carry `peak_shaving_threshold_w`; Python builds the plan).
+- `ev.charge_start_datetime` (earliest charge start), including the relaxed deadline when no slot
+  between the charge start and the deadline is usable.
+- `ev.soc_value_steps` (value of EV energy above the target): fitness credit at the deadline and
+  the seeding fill beyond the target; needs `ev_charge_seeding`.
 
 ## Numerical profile
 

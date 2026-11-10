@@ -378,6 +378,8 @@ pub struct Optimizer<'a> {
     ev_first_charge_slot: usize,
     ev_soc_deadline_slot: Option<i64>,
     ev_target_soc_percentage: Option<f64>,
+    /// `_ev_soc_value_steps`: value of EV energy above the target as (SoC %, amount/kWh) steps.
+    ev_soc_value_steps: Option<Vec<(f64, f64)>>,
     layout: StateLayout,
     mutation_probability: f64,
     // Simulation series (truncated to the control horizon)
@@ -878,7 +880,8 @@ impl<'a> Optimizer<'a> {
             // which an EV never has, so it never planned charging.
             py_max(ev.min_soc_wh - ev.capacity_wh * ev.initial_soc_percentage / 100.0, 0.0)
         };
-        if required <= 0.0 {
+        let value_steps = self.ev_soc_value_steps.as_deref().filter(|steps| !steps.is_empty());
+        if required <= 0.0 && value_steps.is_none() {
             return schedule;
         }
         let mut end = self.ce as i64;
@@ -903,17 +906,64 @@ impl<'a> Optimizer<'a> {
         }
         let max_stored = ev.max_charge_power_w * self.slot_h * ev.charging_efficiency;
         let mut remaining = required;
-        for slot in candidates {
-            let required_rate = remaining / py_max(max_stored, 1e-9);
-            let (rate, idx) =
-                positive.iter().find(|it| it.0 >= required_rate).copied().unwrap_or(positive[positive.len() - 1]);
-            schedule[slot] = idx as i64;
-            remaining -= max_stored * rate;
-            if remaining <= 1e-9 {
-                break;
+        let mut seeded = 0.0;
+        if remaining > 0.0 {
+            for &slot in &candidates {
+                let required_rate = remaining / py_max(max_stored, 1e-9);
+                let (rate, idx) =
+                    positive.iter().find(|it| it.0 >= required_rate).copied().unwrap_or(positive[positive.len() - 1]);
+                schedule[slot] = idx as i64;
+                remaining -= max_stored * rate;
+                seeded += max_stored * rate;
+                if remaining <= 1e-9 {
+                    break;
+                }
+            }
+        }
+        if let Some(steps) = value_steps {
+            // Beyond the target: full power in the cheapest free slots as long as a slot costs
+            // less per stored kWh than the next stored kWh is worth. With direct marketing an
+            // export at a negative tariff is curtailed, so the surplus then costs nothing.
+            let target_soc = self.ev_heuristic_target_soc(ev);
+            let curtails_negative = self.rc.direct_marketing;
+            let (full_rate, full_index) = positive[positive.len() - 1];
+            let full_ac_wh = ev.max_charge_power_w * self.slot_h * full_rate;
+            let fill_cost_wh = |slot: usize| -> f64 {
+                let surplus_wh = if prefer_pv { py_min(py_max(pv[slot] - load[slot], 0.0), full_ac_wh) } else { 0.0 };
+                let surplus_price = if curtails_negative { py_max(feed_in[slot], 0.0) } else { feed_in[slot] };
+                surplus_wh * surplus_price + (full_ac_wh - surplus_wh) * prices[slot]
+            };
+            // Stable sort by the cost of a full-power slot: equal costs keep the candidate order.
+            let mut free: Vec<(usize, f64)> = candidates
+                .iter()
+                .filter(|&&slot| schedule[slot] == zero_index)
+                .map(|&slot| (slot, fill_cost_wh(slot)))
+                .collect();
+            free.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut soc = ev.initial_soc_percentage + seeded / ev.capacity_wh * 100.0;
+            for (slot, cost) in free {
+                if soc >= ev.max_soc_percentage - 1e-9 {
+                    break;
+                }
+                let value_per_wh = ev_soc_value_per_wh(
+                    steps,
+                    py_max(soc, target_soc),
+                    ev.max_soc_percentage,
+                    self.ev_target_soc_percentage,
+                );
+                if cost >= value_per_wh * full_ac_wh * ev.charging_efficiency {
+                    break;
+                }
+                schedule[slot] = full_index as i64;
+                soc += max_stored * full_rate / ev.capacity_wh * 100.0;
             }
         }
         schedule
+    }
+
+    /// `min(_ev_target_soc_percentage, ev.max_soc_percentage)` of the seeding heuristic.
+    fn ev_heuristic_target_soc(&self, ev: &BatterySpec) -> f64 {
+        py_min(self.ev_target_soc_percentage.unwrap_or(0.0), ev.max_soc_percentage)
     }
 
     fn heuristic_appliance_genes(&self) -> Vec<i64> {
@@ -1698,9 +1748,17 @@ pub fn build<'a>(
     let mut optimize_ev = false;
     let mut ev_target = None;
     let mut ev_rates: Vec<f64> = vec![1.0];
+    let mut ev_value_steps: Option<Vec<(f64, f64)>> = None;
     if let Some(p) = &params.ev {
-        optimize_ev = p.min_soc_percentage > p.initial_soc_percentage;
+        // A vehicle at its target is only planned when energy above the target has a value it
+        // can still gain (`_ev_soc_value_headroom`).
+        optimize_ev = p.min_soc_percentage > p.initial_soc_percentage || ev_soc_value_headroom(p);
         ev_target = Some(p.min_soc_percentage as f64);
+        ev_value_steps = p.soc_value_steps.clone().filter(|steps| !steps.is_empty());
+        if ev_value_steps.is_some() && !cfg.semantics.ev_charge_seeding {
+            // soc_value_steps (PR E) builds on the EV seeding of PR B.
+            return Err("EV soc_value_steps need the ev_charge_seeding semantics".into());
+        }
         ev_rates = if let Some(r) = &p.charge_rates {
             r.clone()
         } else if let Some(r) = &cfg.fallback_ev_charge_rates {
@@ -1747,20 +1805,25 @@ pub fn build<'a>(
 
     // EV: charge start and deadline
     let slot_seconds = slot_h * 3600.0;
+    let observation_ts = cfg.observation_datetime.timestamp() as f64
+        + f64::from(cfg.observation_datetime.timestamp_subsec_nanos()) / 1e9;
     let mut ev_first = 0usize;
-    if let Some(p) = &params.ev {
-        if let Some(cs) = &p.charge_start_datetime {
-            let cs_dt = cs.resolve(cfg.timezone);
-            if cs.timestamp_f64(cfg.timezone)
-                <= cfg.observation_datetime.timestamp() as f64
-                    + f64::from(cfg.observation_datetime.timestamp_subsec_nanos()) / 1e9
-            {
-                ev_first = 0;
-            } else {
-                let seconds = total_seconds(&cs_dt, &slot0);
-                let s = (seconds / slot_seconds - 1e-9).ceil() as i64;
-                ev_first = s.max(0).min(ce as i64) as usize;
-            }
+    // `_ev_charge_start_raw_slot`: first full slot after the charge start, relative to slot 0,
+    // not clamped (a charge start in the past gives a negative slot).
+    let ev_charge_start_raw: Option<i64> = params.ev.as_ref().and_then(|p| {
+        let cs = p.charge_start_datetime.as_ref()?;
+        let seconds = total_seconds(&cs.resolve(cfg.timezone), &slot0);
+        Some((seconds / slot_seconds - 1e-9).ceil() as i64)
+    });
+    let ev_charge_start_reached = params
+        .ev
+        .as_ref()
+        .and_then(|p| p.charge_start_datetime.as_ref())
+        .is_some_and(|cs| cs.timestamp_f64(cfg.timezone) <= observation_ts);
+    if let Some(raw) = ev_charge_start_raw {
+        // `_ev_charge_start_slot`.
+        if !ev_charge_start_reached {
+            ev_first = raw.max(0).min(ce as i64) as usize;
         }
     }
     if optimize_ev && ev_first >= ce {
@@ -1775,12 +1838,17 @@ pub fn build<'a>(
         if let Some(dur) = p.min_soc_max_duration_h {
             cands.push((dur * 3600.0 / slot_seconds + 1e-9).floor() as i64);
         }
-        let mut dl = *cands.iter().min()?;
-        if dl >= ce as i64 {
+        let raw_deadline = *cands.iter().min()?;
+        if raw_deadline >= ce as i64 {
             return None;
         }
-        dl = dl.max(0);
-        if 0 < ev_first as i64 && dl <= ev_first as i64 {
+        let dl = raw_deadline.max(0);
+        // Reached: the vehicle can charge from the current slot on.
+        let charge_start = ev_charge_start_raw.map(|raw| if ev_charge_start_reached { raw.min(0) } else { raw });
+        if charge_start.is_some_and(|cs| raw_deadline <= cs) {
+            // No slot the vehicle may charge in ends at or before the deadline: the target is
+            // required at the end of the horizon instead. Both slots are taken before clamping
+            // them to this run (past slots count).
             return None;
         }
         Some(dl)
@@ -1801,7 +1869,8 @@ pub fn build<'a>(
     // Inverter
     let inverter = match &params.inverter {
         Some(ip) => {
-            let inv = Inverter::new(ip, slot_h);
+            let mut inv = Inverter::new(ip, slot_h);
+            inv.threshold_peak_shaving = cfg.semantics.threshold_peak_shaving;
             if let Some(b) = &battery {
                 if inv.battery_id.as_deref() != Some(b.device_id.as_str()) {
                     return Err(format!(
@@ -2004,6 +2073,7 @@ pub fn build<'a>(
             penalty: cfg.genetic.penalty_float("ev_soc_miss").unwrap_or(10.0),
             min_soc: prep.params.ev.as_ref().map(|p| p.min_soc_percentage as f64).unwrap_or(0.0),
             deadline_slot: ev_deadline,
+            soc_value_steps: ev_value_steps.clone(),
         })
     } else {
         None
@@ -2066,6 +2136,7 @@ pub fn build<'a>(
         ev_first_charge_slot: ev_first,
         ev_soc_deadline_slot: ev_deadline,
         ev_target_soc_percentage: if prep.params.ev.is_some() { ev_target } else { None },
+        ev_soc_value_steps: if prep.params.ev.is_some() { ev_value_steps } else { None },
         layout: StateLayout::default(),
         mutation_probability: 0.0,
         prices,
@@ -2229,6 +2300,33 @@ pub fn run_built(opt: &mut Optimizer<'_>, b: Built, individuals: Option<i64>) ->
         eval_seconds: opt.eval_ns as f64 / 1e9,
         profile_seconds: opt.prof.iter().map(|v| *v as f64 / 1e9).collect(),
     })
+}
+
+/// `_ev_soc_value_headroom(ev_parameters)`: a positive SoC value step above the vehicle's SoC
+/// and target.
+fn ev_soc_value_headroom(p: &crate::params::ElectricVehicleParameters) -> bool {
+    let Some(steps) = p.soc_value_steps.as_deref().filter(|steps| !steps.is_empty()) else {
+        return false;
+    };
+    let floor = p.initial_soc_percentage.max(p.min_soc_percentage) as f64;
+    let top = p.max_soc_percentage as f64;
+    steps.iter().any(|&(soc, amount)| amount > 0.0 && py_min(soc, top) > floor)
+}
+
+/// `_ev_soc_value_per_wh(soc_percentage)`: value of the next Wh stored in the EV [amount/Wh].
+///
+/// The amount of the first step above both the SoC and the target; 0.0 at or above the
+/// maximum SoC or above the last step.
+fn ev_soc_value_per_wh(steps: &[(f64, f64)], soc_percentage: f64, max_soc_percentage: f64, target: Option<f64>) -> f64 {
+    if steps.is_empty() || soc_percentage >= max_soc_percentage {
+        return 0.0;
+    }
+    let target = target.unwrap_or(0.0);
+    steps
+        .iter()
+        .find(|&&(step_soc, _)| step_soc > soc_percentage && step_soc > target)
+        .map(|&(_, amount)| amount / 1000.0)
+        .unwrap_or(0.0)
 }
 
 /// `_grid_import_limit_penalty_euro_per_wh`.

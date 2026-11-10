@@ -135,15 +135,27 @@ pub struct Semantics {
     pub executed_ac_controls: bool,
     /// EV seeding reads the requested target SoC and EV charging can shift in time.
     pub ev_charge_seeding: bool,
+    /// With a grid import limit, a battery the plan holds still covers the import above the
+    /// limit (threshold peak shaving, PR D on top of the grid import limit). Off: a held battery
+    /// does not discharge at all (the grid import limit alone).
+    pub threshold_peak_shaving: bool,
 }
 
 impl Semantics {
     /// Akkudoktor-EOS main.
-    pub const EOS_MAIN: Semantics =
-        Semantics { neutral_dc_permission: false, executed_ac_controls: false, ev_charge_seeding: false };
+    pub const EOS_MAIN: Semantics = Semantics {
+        neutral_dc_permission: false,
+        executed_ac_controls: false,
+        ev_charge_seeding: false,
+        threshold_peak_shaving: false,
+    };
     /// Everything this kernel knows (main plus the pending changes above).
-    pub const ALL: Semantics =
-        Semantics { neutral_dc_permission: true, executed_ac_controls: true, ev_charge_seeding: true };
+    pub const ALL: Semantics = Semantics {
+        neutral_dc_permission: true,
+        executed_ac_controls: true,
+        ev_charge_seeding: true,
+        threshold_peak_shaving: true,
+    };
 }
 
 /// Everything a run needs besides the parameters.
