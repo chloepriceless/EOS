@@ -205,7 +205,9 @@ pub struct ElectricVehicleParameters {
     pub min_soc_deadline_datetime: Option<InputDateTime>,
     #[serde(default)]
     pub min_soc_max_duration_h: Option<f64>,
-    #[serde(default)]
+    /// Pending upstream (EV charge start); not serialized when unset, so the reference
+    /// `ElectricVehicleParameters` (extra fields forbidden) validates the output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub charge_start_datetime: Option<InputDateTime>,
     #[serde(flatten, skip_serializing)]
     pub extra: Map<String, Value>,
@@ -233,7 +235,8 @@ pub struct InverterParameters {
     pub max_ac_charge_power_w: Option<f64>,
     #[serde(default)]
     pub ac_charge_limits_total_charge: bool,
-    #[serde(default)]
+    /// Pending upstream (grid import limit); not serialized when unset (see above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_grid_import_power_w: Option<f64>,
     #[serde(flatten, skip_serializing)]
     pub extra: Map<String, Value>,
@@ -348,6 +351,11 @@ impl GeneticOptimizationParameters {
 
     /// The Pydantic checks, as far as they matter for the run.
     pub fn validate(&self) -> Result<(), String> {
+        if self.pv_battery.is_some() && self.inverter.is_none() {
+            // Python keeps such a battery out of the simulation (`GeneticSimulation.prepare`)
+            // but still builds its terminal value curve; not reproduced natively.
+            return Err("a battery without an inverter is not supported natively".into());
+        }
         let e = &self.ems;
         if e.pv_forecast_wh.is_empty() || e.electricity_price_per_wh.is_empty() || e.total_load.is_empty() {
             return Err("Forecast arrays must not be empty.".into());

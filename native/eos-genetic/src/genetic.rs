@@ -1708,6 +1708,10 @@ pub fn build<'a>(
         } else {
             vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         };
+        if optimize_ev && ev_rates.is_empty() {
+            // Python fails in `random.randint(0, -1)` when it builds the first genome.
+            return Err("EV charge rates are empty".into());
+        }
     }
     let bat_rates: Vec<f64> = match (&params.pv_battery, &cfg.fallback_battery_charge_rates) {
         (Some(p), _) if p.charge_rates.as_ref().is_some_and(|r| !r.is_empty()) => {

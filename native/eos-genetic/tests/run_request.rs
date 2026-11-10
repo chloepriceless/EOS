@@ -79,3 +79,30 @@ fn reproduces_known_openblas_kernels() {
     assert!(release["solution"]["result"]["total_balance"].is_number());
     assert!(n1["solution"]["result"]["total_balance"].is_number());
 }
+
+#[test]
+fn rejects_a_battery_without_inverter() {
+    let err = eos_genetic::run::run_json(&with(|v| v["parameters"]["inverter"] = Value::Null)).unwrap_err();
+    assert_eq!(err.code, "run_failed");
+    assert!(err.message.contains("without an inverter"), "{}", err.message);
+}
+
+#[test]
+fn rejects_empty_ev_charge_rates() {
+    // Request rates unset, configured rates empty: Python fails in `random.randint(0, -1)`.
+    let err = eos_genetic::run::run_json(&with(|v| {
+        v["parameters"]["ev"]["charge_rates"] = Value::Null;
+        v["parameters"]["ev"]["min_soc_percentage"] = 80.into();
+        v["fallback_ev_charge_rates"] = serde_json::json!([]);
+    }))
+    .unwrap_err();
+    assert!(err.message.contains("EV charge rates are empty"), "{}", err.message);
+}
+
+#[test]
+fn output_parameters_carry_no_pending_upstream_fields() {
+    let out = run(REQUEST);
+    let parameters = &out["solution"]["parameters"];
+    assert!(parameters["inverter"].get("max_grid_import_power_w").is_none());
+    assert!(parameters["ev"].get("charge_start_datetime").is_none());
+}

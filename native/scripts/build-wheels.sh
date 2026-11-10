@@ -10,6 +10,7 @@ OUT=${1:-$HERE/dist}
 [ $# -gt 0 ] && shift
 TARGETS=${*:-"x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf"}
 mkdir -p "$OUT"
+OUT=$(cd "$OUT" && pwd)
 cd "$HERE/akkudoktoreos-native"
 for target in $TARGETS; do
   case "$target" in

@@ -124,7 +124,8 @@ impl PyRandom {
     /// `_randbelow_with_getrandbits(n)`, n > 0.
     #[inline]
     pub fn randbelow(&mut self, n: u64) -> u64 {
-        debug_assert!(n > 0);
+        // Python raises ValueError("empty range"); a panic becomes NativeRunError in the binding.
+        assert!(n > 0, "empty range for randrange");
         let k = 64 - n.leading_zeros();
         loop {
             let r = self.getrandbits(k);
