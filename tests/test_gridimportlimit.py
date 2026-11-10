@@ -1066,3 +1066,270 @@ class TestWithEvChargeStart:
         assert never_binding.start_solution == unlimited.start_solution
         assert never_binding.result.model_dump() == unlimited.result.model_dump()
         assert never_binding.fitness_history == unlimited.fitness_history
+
+
+# ---------------------------------------------------------------------------
+# Together with the AC charge controls (#1401), the neutral DC permission
+# (#1397) and the periodic full charge (#1486)
+# ---------------------------------------------------------------------------
+
+CONTROL_BATTERY_W = 7000.0
+CONTROL_INVERTER_AC_W = 6000.0
+CONTROL_LOAD_W = 2000.0
+CONTROL_LIMIT_W = 5000.0
+
+
+def _simulate_ac_controls(
+    config_eos: ConfigEOS,
+    *,
+    interval: int,
+    soc: int,
+    limit_w: Optional[float],
+    total_charge: bool,
+    normalize_dc: bool,
+) -> tuple[GeneticOptimization, Battery, dict[str, Any]]:
+    """One AC charge slot at the full charge rate, 2 kW load, inverter AC cap 6 kW."""
+    config_eos.merge_settings_from_dict(
+        {"optimization": {"genetic": {"horizon_hours": 1, "interval_sec": interval}}}
+    )
+    opt = GeneticOptimization(fixed_seed=42)
+    opt.optimize_ev = False
+    opt.optimize_dc_charge = True
+    opt.optimize_battery_grid_export = False
+    opt.bat_possible_charge_values = [1.0]
+    slots = opt.control_slots
+    duration = interval / 3600
+    battery = Battery(
+        SolarPanelBatteryParameters(
+            device_id="battery1",
+            capacity_wh=26400,
+            max_charge_power_w=CONTROL_BATTERY_W,
+            initial_soc_percentage=soc,
+            charging_efficiency=0.95,
+            discharging_efficiency=0.95,
+        ),
+        prediction_hours=slots,
+        slot_duration_h=duration,
+    )
+    inverter = Inverter(
+        InverterParameters(
+            device_id="inverter1",
+            battery_id="battery1",
+            max_power_wh=10000,
+            ac_to_dc_efficiency=0.97,
+            dc_to_ac_efficiency=0.97,
+            max_ac_charge_power_w=CONTROL_INVERTER_AC_W,
+            ac_charge_limits_total_charge=total_charge,
+            max_grid_import_power_w=limit_w,
+        ),
+        battery=battery,
+        slot_duration_h=duration,
+    )
+    inverter.self_consumption_predictor = Mock()
+    inverter.self_consumption_predictor.calculate_expected_direct_consumption.side_effect = min
+    opt.simulation.prepare(
+        parameters=GeneticEnergyManagementParameters(
+            total_load=[CONTROL_LOAD_W * duration] * slots,
+            pv_forecast_wh=[0.0] * slots,
+            electricity_price_per_wh=[0.0003] * slots,
+            feed_in_tariff_per_wh=[0.0001] * slots,
+            price_per_wh_battery=0.00005,
+        ),
+        optimization_hours=slots,
+        prediction_hours=slots,
+        inverter=inverter,
+    )
+    ac, dc, discharge, export = opt.decode_charge_discharge(np.array([2] * slots))
+    opt.simulation.ac_charge_hours = ac.copy()
+    opt.simulation.dc_charge_hours = dc.copy()
+    opt.simulation.bat_discharge_hours = discharge.copy()
+    opt.simulation.bat_grid_export_hours = export.copy()
+    result = opt.simulation.simulate(0, prefer_dc_charge_when_neutral=normalize_dc)
+    return opt, battery, result
+
+
+class TestWithAcChargeControls:
+    """The reported AC factor is the one the slot executed: inverter cap, then grid limit."""
+
+    INVERTER_CAP = CONTROL_INVERTER_AC_W * 0.97 / CONTROL_BATTERY_W
+    LIMITED = (CONTROL_LIMIT_W - CONTROL_LOAD_W) * 0.97 / CONTROL_BATTERY_W
+
+    @pytest.mark.parametrize("interval", [900, 3600])
+    @pytest.mark.parametrize("total_charge", [False, True])
+    @pytest.mark.parametrize("normalize_dc", [False, True])
+    @pytest.mark.parametrize(
+        "soc,limit_w,expected",
+        [
+            pytest.param(50, CONTROL_LIMIT_W, LIMITED, id="grid-limit-below-inverter-cap"),
+            pytest.param(50, 1e9, INVERTER_CAP, id="inverter-cap-limit-not-binding"),
+            pytest.param(50, None, INVERTER_CAP, id="inverter-cap-no-limit"),
+            pytest.param(50, CONTROL_LOAD_W, 0.0, id="no-headroom"),
+            pytest.param(100, CONTROL_LIMIT_W, 0.0, id="full-battery"),
+        ],
+    )
+    def test_reported_controls_replay_the_simulation(
+        self, config_eos, interval, total_charge, normalize_dc, soc, limit_w, expected
+    ):
+        opt, battery, actual = _simulate_ac_controls(
+            config_eos,
+            interval=interval,
+            soc=soc,
+            limit_w=limit_w,
+            total_charge=total_charge,
+            normalize_dc=normalize_dc,
+        )
+        assert opt.simulation.ac_charge_hours is not None
+        assert opt.simulation.dc_charge_hours is not None
+        ac = opt.simulation.ac_charge_hours.copy()
+        dc = opt.simulation.dc_charge_hours.copy()
+        final_soc = battery.soc_wh
+        assert ac[0] == pytest.approx(expected)
+        if expected == 0.0:
+            # A cancelled AC slot keeps the PV permission the AC state gave.
+            assert dc[0] == 1.0
+        if limit_w is not None:
+            slot_limit_wh = limit_w * interval / 3600
+            assert max(actual["Netzbezug_Wh_pro_Stunde"]) <= slot_limit_wh + 1e-6
+
+        # Replaying the returned controls must reproduce every energy/cost value.
+        battery.reset()
+        opt.simulation.ac_charge_hours = ac.copy()
+        opt.simulation.dc_charge_hours = dc.copy()
+        replay = opt.simulation.simulate(0)
+        for key, value in actual.items():
+            if key == "grid_limited_ac_charge_wh":
+                # Fitness bookkeeping of the slots the limit lowered: the replay
+                # already runs at the lowered factor.
+                continue
+            np.testing.assert_array_equal(replay[key], value, err_msg=key)
+        assert battery.soc_wh == final_soc
+
+
+FULL_CHARGE_HOURS = 24
+FULL_CHARGE_LIMIT_W = 3000.0
+
+
+def _optimize_full_charge(
+    config_eos: ConfigEOS,
+    *,
+    limit_w: Optional[float],
+    full_charge: bool,
+    ev: bool = False,
+    seed: int = 42,
+) -> GeneticSolution:
+    """Hourly day, no PV, flat expensive energy except two cheap hours.
+
+    The battery (10 kWh, 5 kW, 30 %) must reach 100 % once by 12:00 when the
+    full charge is due. The optional EV arrives at 02:00 and needs 6 kWh by
+    08:00; the cheap hours 03:00-05:00 suit both.
+    """
+    config_eos.merge_settings_from_dict(
+        {
+            "prediction": {"hours": FULL_CHARGE_HOURS},
+            "optimization": {
+                "algorithm": "GENETIC",
+                "genetic": {
+                    "individuals": 100,
+                    "generations": 40,
+                    "tail_horizon_hours": 0,
+                    "horizon_hours": FULL_CHARGE_HOURS,
+                    "interval_sec": 3600,
+                    "terminal_value_mode": "FIXED",
+                    "terminal_value_euro_per_kwh": 0.0,
+                },
+            },
+            "feedintariff": {"direct_marketing_enabled": False},
+        }
+    )
+    slot0 = to_datetime("2026-11-20T00:00:00")
+    get_ems(init=True).set_start_datetime(slot0)
+    prices = [0.0004] * FULL_CHARGE_HOURS
+    prices[3] = prices[4] = 0.0001
+    battery: dict[str, Any] = {
+        "device_id": "battery1",
+        "capacity_wh": 10000,
+        "initial_soc_percentage": 30,
+        "min_soc_percentage": 0,
+        "max_soc_percentage": 100,
+        "charging_efficiency": 1.0,
+        "discharging_efficiency": 1.0,
+        "max_charge_power_w": 5000,
+    }
+    if full_charge:
+        battery["full_charge_soc_percentage"] = 100
+        battery["full_charge_deadline_datetime"] = slot0.add(hours=12)
+    parameters = GeneticOptimizationParameters.model_validate(
+        {
+            "ems": {
+                "pv_forecast_wh": [0.0] * FULL_CHARGE_HOURS,
+                "total_load": [200.0] * FULL_CHARGE_HOURS,
+                "electricity_price_per_wh": prices,
+                "feed_in_tariff_per_wh": 0.00007,
+                "price_per_wh_battery": 0.0,
+            },
+            "pv_battery": battery,
+            "inverter": {
+                "device_id": "inverter1",
+                "max_power_wh": 10000,
+                "battery_id": "battery1",
+                "ac_to_dc_efficiency": 1.0,
+                "dc_to_ac_efficiency": 1.0,
+                "max_ac_charge_power_w": 5000,
+                "max_grid_import_power_w": limit_w,
+            },
+            "ev": {
+                "device_id": "car",
+                "capacity_wh": 60000,
+                "initial_soc_percentage": 0,
+                "min_soc_percentage": 10,
+                "max_soc_percentage": 100,
+                "charging_efficiency": 1.0,
+                "max_charge_power_w": 3000,
+                "charge_rates": [0.0, 0.5, 1.0],
+                "charge_start_datetime": "2026-11-20T02:00:00",
+                "min_soc_deadline_datetime": "2026-11-20T08:00:00",
+            }
+            if ev
+            else None,
+        }
+    )
+    return GeneticOptimization(fixed_seed=seed).optimize_ems(
+        parameters=parameters, start_hour=0, ngen=40
+    )
+
+
+class TestWithPeriodicFullCharge:
+    """A due full charge (#1486) is reached within the grid import limit."""
+
+    def test_full_charge_is_reached_within_the_limit(self, config_eos):
+        free = _optimize_full_charge(config_eos, limit_w=None, full_charge=True)
+        limited = _optimize_full_charge(config_eos, limit_w=FULL_CHARGE_LIMIT_W, full_charge=True)
+
+        # Without the limit the cheap hours charge at the full 5 kW.
+        assert max(free.result.grid_consumption_wh_per_hour) > FULL_CHARGE_LIMIT_W
+        # With it, 2.8 kW per hour reach 100 % too, a few hours later.
+        assert max(limited.result.grid_consumption_wh_per_hour) <= FULL_CHARGE_LIMIT_W + 1e-6
+        assert max(limited.result.battery_soc_per_hour[:13]) >= 99.0
+
+    def test_full_charge_and_ev_share_the_limit(self, config_eos):
+        solution = _optimize_full_charge(
+            config_eos, limit_w=FULL_CHARGE_LIMIT_W, full_charge=True, ev=True
+        )
+
+        assert max(solution.result.grid_consumption_wh_per_hour) <= FULL_CHARGE_LIMIT_W + 1e-6
+        assert max(solution.result.battery_soc_per_hour[:13]) >= 99.0
+        assert solution.ev_charge_hours_float is not None
+        # Nothing before the arrival; the EV still reaches its target in time.
+        assert not any(solution.ev_charge_hours_float[:2])
+        assert solution.result.ev_soc_per_hour[8] >= 10.0 - 1e-6
+
+    def test_never_binding_limit_keeps_the_full_charge_plan(self, config_eos):
+        """None and a limit above every import give bit-identical full charge plans."""
+        unlimited = _optimize_full_charge(config_eos, limit_w=None, full_charge=True, ev=True)
+        never_binding = _optimize_full_charge(config_eos, limit_w=1e9, full_charge=True, ev=True)
+
+        assert never_binding.ac_charge == unlimited.ac_charge
+        assert never_binding.ev_charge_hours_float == unlimited.ev_charge_hours_float
+        assert never_binding.start_solution == unlimited.start_solution
+        assert never_binding.result.model_dump() == unlimited.result.model_dump()
+        assert never_binding.fitness_history == unlimited.fitness_history
