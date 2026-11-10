@@ -5,8 +5,8 @@
 //! (`InverterParameters`) and `devices/genetic/homeappliance.py` (`HomeApplianceParameters`).
 //! Field names and defaults as in Python (`model_dump(mode="json")`), old German
 //! field names as aliases. Unknown fields are – unlike Python (`extra="forbid"`) –
-//! collected in `extra`, so that new upstream fields (e.g. `peak_shaving_threshold_w` from PR D)
-//! do not abort the run; `validate()` reports them.
+//! collected in `extra`, so that new upstream fields do not abort the parsing; `validate()`
+//! rejects them, and the run falls back to Python.
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
 use chrono_tz::Tz;

@@ -16,11 +16,9 @@
 //! reading, `null` in number series becomes NaN again; on writing, NaN/±inf become `null`
 //! (serde_json behaviour for non-finite numbers).
 //!
-//! Extensibility (not yet in the reference version): PR E (`soc_value_steps`) arrives as a new
-//! `Option` field on [`GeneticSolution`] or [`TerminalValueResult`] with
-//! `#[serde(default, skip_serializing_if = "Option::is_none")]`; PR D
-//! (`peak_shaving_threshold_w`) belongs to the FRBC instruction, see
-//! [`super::plan::PlanInstruction::peak_shaving_threshold_w`].
+//! Pending changes: PR E (`soc_value_steps`) adds no solution field (only an input and the
+//! fitness); PR D (`peak_shaving_threshold_w`) belongs to the plan's FRBC instruction, which
+//! Python builds from this solution (`GeneticSolution.energy_management_plan`).
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use serde::de::Error as _;
