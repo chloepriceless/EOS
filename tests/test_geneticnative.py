@@ -153,6 +153,7 @@ def _synthetic_input(
         },
         "inverter": {"device_id": "inverter1", "max_power_wh": 10000, "battery_id": "battery1"},
         "forecast_interval_seconds": interval,
+        "ev": None,
     }
     if ev:
         data["ev"] = {
@@ -332,6 +333,17 @@ class TestGuard:
             "neutral_dc_permission": False,
             "executed_ac_controls": False,
             "ev_charge_seeding": False,
+        }
+
+    def test_uncertified_sources_with_all_switches(self, monkeypatch):
+        monkeypatch.setattr(native, "_import_native", lambda: _fake_kernel())
+        monkeypatch.setenv(native.UNCERTIFIED_ENV, "all")
+        status = native.native_status()
+        assert status.available and not status.certified
+        assert status.semantics == {
+            "neutral_dc_permission": True,
+            "executed_ac_controls": True,
+            "ev_charge_seeding": True,
         }
 
     def test_certified_sources(self, monkeypatch):
@@ -560,6 +572,83 @@ class TestNativeEqualsPython:
         python, native_solution = _run_both(
             config_eos, lambda: _load_input("optimize_input_2.json")
         )
+        assert native.compare_solutions(python, native_solution) == []
+
+    @pytest.mark.parametrize("interval", [3600, 900])
+    @pytest.mark.parametrize("ev", [False, True])
+    def test_grid_import_limit_with_threshold_peak_shaving(self, config_eos, interval, ev):
+        """Held slots shave the import above the limit (PR D); plans carry the threshold."""
+        _configure(config_eos, interval_sec=interval, horizon_hours=24, tail_horizon_hours=12)
+        slots = 48 * 3600 // interval
+
+        def make() -> GeneticOptimizationParameters:
+            data = _synthetic_input(
+                slots=slots, interval=interval, seed=21 + interval, ev=ev, feed_in_series=True,
+                deadline="2026-09-17T07:00:00+02:00",
+            ).model_dump(mode="json")
+            data["inverter"]["max_grid_import_power_w"] = 900.0
+            data["pv_battery"]["charge_rates"] = [0.0, 0.1, 0.25, 0.5, 1.0]
+            return GeneticOptimizationParameters(**data)
+
+        python, native_solution = _run_both(config_eos, make, seed=13)
+        assert native.compare_solutions(python, native_solution) == []
+
+        def plan(solution: GeneticSolution) -> list[dict[str, Any]]:
+            dump = solution.energy_management_plan().model_dump(mode="json")
+            for instruction in dump["instructions"]:
+                instruction.pop("id", None)
+            return dump["instructions"]
+
+        python_plan = plan(python)
+        assert native.diff_values(python_plan, plan(native_solution)) == []
+        thresholds = {i.get("peak_shaving_threshold_w") for i in python_plan if i.get("resource_id") == "battery1"}
+        assert thresholds == {900.0}
+
+    @pytest.mark.parametrize("initial", [30, 70])
+    @pytest.mark.parametrize("direct_marketing", [False, True])
+    def test_ev_soc_value_steps(self, config_eos, initial, direct_marketing):
+        """Energy above the EV target earns the steps' value (PR E), also at the target."""
+        _configure(
+            config_eos, interval_sec=900, horizon_hours=24, tail_horizon_hours=12,
+            direct_marketing=direct_marketing,
+        )
+
+        def make() -> GeneticOptimizationParameters:
+            data = _synthetic_input(
+                slots=192, interval=900, seed=31 + initial, feed_in_series=True,
+                deadline="2026-09-17T07:00:00+02:00",
+            ).model_dump(mode="json")
+            data["ev"]["initial_soc_percentage"] = initial
+            data["ev"]["max_soc_percentage"] = 95
+            data["ev"]["soc_value_steps"] = [[80.0, 0.3], [90.0, 0.12]]
+            return GeneticOptimizationParameters(**data)
+
+        python, native_solution = _run_both(config_eos, make, seed=17)
+        assert native.compare_solutions(python, native_solution) == []
+        assert native_solution.ev_charge_hours_float is not None
+
+    @pytest.mark.parametrize(
+        ("charge_start", "deadline"),
+        [
+            # deadline before the earliest charge start: the target is due at the horizon end
+            ("2026-09-16T15:00:00+02:00", "2026-09-16T14:30:00+02:00"),
+            # charge start already reached: the vehicle charges right away
+            ("2026-09-16T09:00:00+02:00", "2026-09-16T12:00:00+02:00"),
+            # charge start in the horizon, deadline after it
+            ("2026-09-16T13:10:00+02:00", "2026-09-16T20:00:00+02:00"),
+        ],
+    )
+    def test_ev_charge_start_and_deadline(self, config_eos, charge_start, deadline):
+        _configure(config_eos, interval_sec=900, horizon_hours=24, tail_horizon_hours=12)
+
+        def make() -> GeneticOptimizationParameters:
+            data = _synthetic_input(
+                slots=192, interval=900, seed=41, deadline=deadline
+            ).model_dump(mode="json")
+            data["ev"]["charge_start_datetime"] = charge_start
+            return GeneticOptimizationParameters(**data)
+
+        python, native_solution = _run_both(config_eos, make, seed=19)
         assert native.compare_solutions(python, native_solution) == []
 
     def test_battery_without_inverter_falls_back(self, config_eos):

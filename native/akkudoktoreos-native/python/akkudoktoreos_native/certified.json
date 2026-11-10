@@ -2,16 +2,30 @@
   "format": 1,
   "entries": [
     {
+      "fingerprint": "sha256:5f92c7c20b34a8f7f773101ac2a8236790b48736dfd0a47cb67a091facd25e5a",
+      "semantics": {
+        "neutral_dc_permission": true,
+        "executed_ac_controls": true,
+        "ev_charge_seeding": true,
+        "threshold_peak_shaving": true
+      },
+      "kernel_version": "0.2.0",
+      "verified": "2026-11-10",
+      "evidence": "190 identical runs, 19 not supported natively, 13 with patched Python, 0 different (dot: detected)",
+      "note": "feat/prod-on-upstream-20261111: Akkudoktor-EOS main 7767028 + #1397/#1401 + EV charge start, EV seeding, EV SoC value steps, grid import limit, threshold peak shaving + native backend; GENETIC test suite in compare mode on linux/aarch64, Neoverse N1 profile (also 0 different with sequential dot)"
+    },
+    {
       "fingerprint": "sha256:add0598d6e82361a3d16884c8792b84d499bb11ac4b9f4b17a4bccfbf380ca6d",
       "semantics": {
         "neutral_dc_permission": false,
         "executed_ac_controls": false,
-        "ev_charge_seeding": false
+        "ev_charge_seeding": false,
+        "threshold_peak_shaving": false
       },
-      "kernel_version": "0.1.0",
+      "kernel_version": "0.2.0",
       "verified": "2026-11-10",
-      "evidence": "56 identical runs, 23 not supported natively, 14 with patched Python, 0 different (dot: sequential)",
-      "note": "Akkudoktor-EOS main 7767028 + native GENETIC backend; GENETIC test suite in compare mode on linux/aarch64, Neoverse N1 profile and sequential dot"
+      "evidence": "60 identical runs, 19 not supported natively, 14 with patched Python, 0 different (dot: detected)",
+      "note": "Akkudoktor-EOS main 7767028 + native GENETIC backend; GENETIC test suite in compare mode on linux/aarch64, Neoverse N1 profile (re-verified with kernel 0.2.0)"
     }
   ]
 }
