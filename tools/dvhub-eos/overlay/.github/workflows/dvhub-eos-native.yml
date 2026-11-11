@@ -4,8 +4,9 @@
 #   1. "native certified": the fingerprint of the GENETIC sources is in certified.json of the
 #      kernel built from native/ - otherwise this check is red (port the change to native/ and
 #      certify it, see native/README.md);
-#   2. compare: the generated scenarios (native/scripts/parity_scenarios.py) run in Python and in
-#      the kernel; any difference or kernel failure is red.
+#   2. compare: the generated scenarios (native/scripts/parity_scenarios.py --strict) run in
+#      Python and in the kernel; a difference, a kernel failure or a scenario the kernel rejects
+#      (it would run in Python) is red.
 # The upstream workflow native.yml additionally compares every GENETIC run of the test suite.
 name: DVhub-EOS native kernel
 
@@ -52,6 +53,7 @@ jobs:
           uv pip install --python ../../.venv/bin/python dist/*.whl
 
       - name: Native certified (yes/no)
+        shell: bash  # -eo pipefail: the exit status survives the pipe into tee
         run: |
           uv run --no-sync python - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
           import sys
@@ -75,7 +77,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/scenarios" && cd "$RUNNER_TEMP/scenarios"
           uv run --no-sync --project "$GITHUB_WORKSPACE" \
             python "$GITHUB_WORKSPACE/native/scripts/parity_scenarios.py" \
-            --count 200 --seed 1 --out "$GITHUB_WORKSPACE/scenarios.json"
+            --count 200 --seed 1 --strict --out "$GITHUB_WORKSPACE/scenarios.json"
 
       - uses: actions/upload-artifact@v7
         if: always()
