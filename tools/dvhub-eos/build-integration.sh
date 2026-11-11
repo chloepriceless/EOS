@@ -46,6 +46,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Die Commits dieses Skripts sind erzeugt (Merges, overlay/, gen-docs); ihr Inhalt wird in den
+# PR-Zweigen bzw. im Zweig dvhub-eos/tooling geprüft. Kein Codex-Review je Neubau.
+export CODEX_REVIEW_SKIP=1
+
 die() { echo "ABBRUCH: $*" >&2; exit 1; }
 say() { echo "== $*"; }
 
