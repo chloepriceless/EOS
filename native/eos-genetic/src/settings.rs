@@ -12,6 +12,9 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Default of `penalties["grid_import_limit_excess"]` [EUR/kWh].
+pub const GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH: f64 = 10.0;
+
 /// `TerminalValueMode`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TerminalValueMode {
@@ -53,6 +56,7 @@ pub fn default_penalties() -> Map<String, Value> {
     m.insert("ev_soc_miss".into(), Value::from(10));
     m.insert("ac_charge_break_even".into(), Value::from(1.0));
     m.insert("battery_full_charge_miss".into(), Value::from(10));
+    m.insert("grid_import_limit_excess".into(), Value::from(GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH));
     m
 }
 

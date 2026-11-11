@@ -56,8 +56,22 @@ def pytest_configure(config: Any) -> None:
         "_evaluation_worker_init": genetic_module._evaluation_worker_init,
     }
 
+    # Methods of the optimizer and the simulation as the session starts: a test that replaces
+    # one (monkeypatch.setattr on the class) runs other Python than the kernel reproduces.
+    from akkudoktoreos.optimization.genetic.genetic import GeneticSimulation
+
+    pristine_methods = {
+        (cls, name): value
+        for cls in (GeneticOptimization, GeneticSimulation)
+        for name, value in vars(cls).items()
+        if (callable(value) or isinstance(value, (staticmethod, classmethod)))
+        and name != "_optimize_ems_run"  # replaced by this plugin below
+    }
+
     def patched(self: Any) -> bool:
         if isinstance(getattr(self, "optimize", None), mock.Mock):
+            return True
+        if any(vars(cls).get(name) is not value for (cls, name), value in pristine_methods.items()):
             return True
         return any(getattr(genetic_module, name) is not fn for name, fn in pristine.items())
 

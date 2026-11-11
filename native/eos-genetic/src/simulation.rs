@@ -6,8 +6,8 @@
 
 use crate::devices::battery::{Battery, BatterySpec, SimError};
 use crate::devices::homeappliance::{ApplianceGene, HomeAppliance, StartDecoder};
-use crate::devices::inverter::Inverter;
-use crate::numpy::{self, DotKernel, NumericProfile, py_max};
+use crate::devices::inverter::{GRID_IMPORT_LIMIT_TOLERANCE_WH, Inverter};
+use crate::numpy::{self, DotKernel, NumericProfile, py_max, py_min};
 use crate::selfconsumption::SelfConsumption;
 
 /// Fitness on an error in the simulation (`except Exception: return (100000.0,)`).
@@ -66,8 +66,40 @@ pub struct FullCharge {
 #[derive(Debug, Clone)]
 pub struct EvPenalty {
     pub penalty: f64,
+    /// `parameters.ev.min_soc_percentage`, also the target `_ev_soc_value_credit` starts at.
     pub min_soc: f64,
     pub deadline_slot: Option<i64>,
+    /// `_ev_soc_deadline_share`: share of the deadline slot's charge before the deadline.
+    pub deadline_share: f64,
+    /// `_ev_soc_value_steps` (non-empty), credited above the target.
+    pub soc_value_steps: Option<Vec<(f64, f64)>>,
+}
+
+impl EvPenalty {
+    /// `_ev_soc_value_credit(soc_percentage)`: credit for the EV energy above the target.
+    ///
+    /// Each kWh between the target and a step's SoC earns that step's amount; energy below the
+    /// target, above the last step or above the maximum SoC earns nothing.
+    pub fn soc_value_credit(&self, ev: &Battery, soc_percentage: f64) -> f64 {
+        let Some(steps) = self.soc_value_steps.as_deref() else {
+            return 0.0;
+        };
+        let kwh_per_percent = ev.s.capacity_wh / 100.0 / 1000.0;
+        let mut lower = self.min_soc;
+        let top = py_min(soc_percentage, ev.s.max_soc_percentage);
+        let mut credit = 0.0;
+        for &(step_soc, amount) in steps {
+            if lower >= top {
+                break;
+            }
+            let upper = py_min(step_soc, top);
+            if upper > lower {
+                credit += (upper - lower) * kwh_per_percent * amount;
+            }
+            lower = py_max(lower, step_soc);
+        }
+        credit
+    }
 }
 
 /// Everything an evaluation needs that does not change during the run.
@@ -85,6 +117,15 @@ pub struct RunConst {
     pub decode: DecodeTable,
     pub ev_rates: Vec<f64>,
     pub ev_zero_index: Option<usize>,
+    /// EV charge rates the charger accepts, highest first, with 0.0 (`ev_rates_desc` of
+    /// `simulate`): with a grid import limit, EV charging that does not fit is lowered to the
+    /// next of them. From `ev_possible_charge_values` whenever the run has an EV.
+    pub ev_limit_rates_desc: Vec<f64>,
+    /// The inverter scaled to the two parts of a partly passed slot 0 (without and with the EV,
+    /// `_split_ev_slot_energy`): only with a grid import limit, an EV and a run inside slot 0.
+    pub ev_split_inverters: Option<(Inverter, Inverter)>,
+    pub ev_first_charge_slot: usize,
+    pub ev_charge_start_slot: usize,
     pub battery: Option<BatterySpec>,
     pub ev: Option<BatterySpec>,
     pub inverter: Option<Inverter>,
@@ -94,6 +135,7 @@ pub struct RunConst {
     pub terminal: Terminal,
     pub break_even: Option<BreakEven>,
     pub full_charge: Option<FullCharge>,
+    pub grid_penalty_per_wh: f64,
     pub ev_penalty: Option<EvPenalty>,
     /// `parameters.ev.min_soc_percentage`, if the EV parameters and the simulation have an EV.
     pub ev_extra_min_soc: Option<f64>,
@@ -123,6 +165,13 @@ pub struct SimResult {
     pub ha: Vec<f64>,
     pub price: Vec<f64>,
     pub tariff: Vec<f64>,
+    /// `grid_limited_ac_charge_wh` (only with a grid import limit): slot → AC energy.
+    pub grid_limited: Option<Vec<(usize, f64)>>,
+    /// `peak_shaving_wh_per_hour` (only with a grid import limit).
+    pub peak_shaving: Option<Vec<f64>>,
+    /// `ev_grid_limited_charge_factors` (only with a grid import limit and an EV): slot → the
+    /// EV charge factor executed where the limit lowered it.
+    pub ev_grid_limited: Option<Vec<(usize, f64)>>,
 }
 
 impl SimResult {
@@ -160,6 +209,7 @@ pub struct Evaluator {
     // Result series (always filled, small)
     pub res: SimResult,
     pub evaluations: u64,
+    scratch: Vec<f64>,
 }
 
 impl Evaluator {
@@ -196,6 +246,7 @@ impl Evaluator {
                 ..SimResult::default()
             },
             evaluations: 0,
+            scratch: Vec::new(),
         }
     }
 
@@ -261,6 +312,14 @@ impl Evaluator {
         }
         // EV
         if rc.optimize_ev {
+            if let Some(zero) = rc.ev_zero_index {
+                let first = rc.ev_first_charge_slot;
+                if first > 0 {
+                    for slot in 0..first.min(ce) {
+                        g[ce + slot] = zero as i64;
+                    }
+                }
+            }
             let n = rc.ev_rates.len() as i64;
             for i in 0..ce {
                 let mut idx = g[ce + i];
@@ -310,10 +369,44 @@ impl Evaluator {
             for i in end_hour..ce {
                 self.ev_charge[i] = 0.0;
             }
+            let cs = rc.ev_charge_start_slot;
+            if cs > 0 {
+                for i in 0..cs.min(ce) {
+                    self.ev_charge[i] = 0.0;
+                }
+            }
             e.charge_array.copy_from_slice(&self.ev_charge);
         }
         self.ac_read.copy_from_slice(&self.ac);
         self.ev_read.copy_from_slice(&self.ev_charge);
+        let max_grid_import = inv.and_then(|i| i.max_grid_import_wh);
+        let mut grid_limited: Option<Vec<(usize, f64)>> = max_grid_import.map(|_| Vec::new());
+        let mut peak_shaving: Option<Vec<f64>> = max_grid_import.map(|_| {
+            let mut v = self.res.peak_shaving.take().unwrap_or_default();
+            v.clear();
+            v.resize(end_hour, 0.0);
+            v
+        });
+        // With a grid import limit, EV charging gives way to it: a slot whose import exceeds
+        // the limit is simulated again at the next lower EV charge rate, down to no charging.
+        let ev_limited = max_grid_import.is_some() && self.ev.is_some();
+        let ev_limit_wh = match max_grid_import {
+            Some(lim) if ev_limited => lim + GRID_IMPORT_LIMIT_TOLERANCE_WH,
+            _ => 0.0,
+        };
+        let mut ev_grid_limited: Option<Vec<(usize, f64)>> = if ev_limited { Some(Vec::new()) } else { None };
+        // A run inside slot 0 charges the EV only in the part still ahead; with a limit, slot 0
+        // is then simulated as a part without and a part with the EV (`_split_ev_slot_energy`).
+        let mut ev_first_slot_extra = 0.0;
+        let mut ev_first_slot_share = 1.0;
+        if ev_limited {
+            if let Some(e) = self.ev.as_ref() {
+                ev_first_slot_share = e.s.first_slot_share;
+                if 0.0 < ev_first_slot_share && ev_first_slot_share < 1.0 {
+                    ev_first_slot_extra = 1.0 / ev_first_slot_share - 1.0;
+                }
+            }
+        }
         let has_bat = self.bat.is_some();
         let lcos = self.bat.as_ref().map(|b| (b.s.discharging_efficiency, b.s.levelized_cost_of_storage_kwh));
 
@@ -328,13 +421,31 @@ impl Evaluator {
             } else {
                 self.res.ha[idx] = 0.0;
             }
+            // EV state before charging in this slot, kept only where the grid import limit may
+            // lower the EV charging of the slot.
+            let mut ev_slot_state: Option<(f64, f64, f64)> = None;
+            let mut consumption_without_ev = consumption;
+            // Import the EV would add if it charged all of slot 0 [Wh].
+            let mut ev_import_extra = 0.0;
+            let mut ev_charge_factor = 0.0;
             if let Some(e) = self.ev.as_mut() {
                 self.res.ev_soc[idx] = (e.soc_wh / e.s.capacity_wh) * 100.0;
-                let f = self.ev_read[hour];
-                if f > 0.0 {
-                    let (s, l) = e.charge_energy(None, hour, f)?;
+                ev_charge_factor = self.ev_read[hour];
+                if ev_charge_factor > 0.0 {
+                    if ev_limited {
+                        ev_slot_state = Some(e.slot_state(hour));
+                        consumption_without_ev = consumption;
+                    }
+                    let (s, l) = e.charge_energy(None, hour, ev_charge_factor)?;
                     consumption += s + l;
                     slot_losses += l;
+                    if hour == 0 {
+                        ev_import_extra = (s + l) * ev_first_slot_extra;
+                    }
+                    if s + l <= 0.0 {
+                        // Nothing charged (EV full): nothing to lower.
+                        ev_slot_state = None;
+                    }
                 }
             } else {
                 self.res.ev_soc[idx] = 0.0;
@@ -347,6 +458,7 @@ impl Evaluator {
             let mut feedin = 0.0;
             let mut grid_import = 0.0;
             let mut losses = 0.0;
+            let mut limit_import = 0.0;
             let mut acf = 0.0;
             if has_bat && ac_possible {
                 acf = self.ac_read[hour];
@@ -364,25 +476,106 @@ impl Evaluator {
                 let produced = rc.pv[hour];
                 let export_factor = self.exp[hour];
                 let allowed = dm && tariff > 0.0 && export_factor > 0.0;
-                let (fi, gi, l, _) = i.process_energy(
+                // The import never exceeds the load: only a slot whose load exceeds the limit
+                // can need its EV charging lowered.
+                let mut battery_slot_state: Option<(f64, f64, f64)> = None;
+                if ev_slot_state.is_some() && consumption + ev_import_extra > ev_limit_wh {
+                    if let Some(b) = self.bat.as_ref() {
+                        battery_slot_state = Some(b.slot_state(hour));
+                    }
+                } else {
+                    ev_slot_state = None;
+                }
+                let mut peak;
+                (feedin, grid_import, losses, peak, limit_import) = slot_energy(
+                    i,
+                    rc,
                     self.bat.as_mut(),
                     &mut self.sc,
-                    produced,
-                    consumption,
                     hour,
+                    produced,
+                    consumption_without_ev,
+                    consumption,
+                    ev_import_extra,
+                    ev_first_slot_share,
                     allowed,
                     export_factor,
                 )?;
-                feedin = fi;
-                grid_import = gi;
-                losses = l;
+                if let (Some(state), Some(e)) = (ev_slot_state, self.ev.as_mut()) {
+                    if limit_import > ev_limit_wh {
+                        // The grid import limit wins against EV charging: the slot is simulated
+                        // again at the next lower charge rate until it fits, or without EV
+                        // charging.
+                        for &ev_rate in rc.ev_limit_rates_desc.iter() {
+                            if ev_rate >= ev_charge_factor {
+                                continue;
+                            }
+                            if let (Some(bs), Some(b)) = (battery_slot_state, self.bat.as_mut()) {
+                                b.restore_slot_state(hour, bs);
+                            }
+                            e.restore_slot_state(hour, state);
+                            e.charge_array[hour] = ev_rate;
+                            consumption = consumption_without_ev;
+                            slot_losses = 0.0;
+                            ev_import_extra = 0.0;
+                            if ev_rate > 0.0 {
+                                let (s, l) = e.charge_energy(None, hour, ev_rate)?;
+                                consumption += s + l;
+                                slot_losses += l;
+                                if hour == 0 {
+                                    ev_import_extra = (s + l) * ev_first_slot_extra;
+                                }
+                            }
+                            (feedin, grid_import, losses, peak, limit_import) = slot_energy(
+                                i,
+                                rc,
+                                self.bat.as_mut(),
+                                &mut self.sc,
+                                hour,
+                                produced,
+                                consumption_without_ev,
+                                consumption,
+                                ev_import_extra,
+                                ev_first_slot_share,
+                                allowed,
+                                export_factor,
+                            )?;
+                            if limit_import <= ev_limit_wh {
+                                break;
+                            }
+                        }
+                        if let Some(gl) = ev_grid_limited.as_mut() {
+                            gl.push((idx, e.charge_array[hour]));
+                        }
+                    }
+                }
+                if let Some(ps) = peak_shaving.as_mut() {
+                    ps[idx] = peak;
+                }
             }
             if acf > 0.0 && has_bat {
+                let mut grid_limited_slot = false;
                 let (ac_energy, ac_losses);
                 {
                     let b = self.bat.as_mut().ok_or(SimError)?;
                     if let Some(i) = inv {
-                        (ac_energy, ac_losses) = i.charge_battery_from_grid(b, hour, acf)?;
+                        if max_grid_import.is_none() {
+                            let (a, l, _) = i.charge_battery_from_grid_executed(b, hour, acf, None)?;
+                            ac_energy = a;
+                            ac_losses = l;
+                        } else {
+                            let (a, l, executed) =
+                                i.charge_battery_from_grid_executed(b, hour, acf, Some(limit_import))?;
+                            ac_energy = a;
+                            ac_losses = l;
+                            if executed < acf {
+                                grid_limited_slot = true;
+                                self.ac[hour] = executed;
+                                if executed <= 0.0 && self.dc[hour] == 0.0 {
+                                    self.dc[hour] = 1.0;
+                                }
+                            }
+                        }
                     } else {
                         let (stored, l) = b.charge_energy(None, hour, acf)?;
                         ac_energy = stored + l;
@@ -392,6 +585,11 @@ impl Evaluator {
                 consumption += ac_energy;
                 grid_import += ac_energy;
                 slot_losses += ac_losses;
+                if grid_limited_slot {
+                    if let Some(gl) = grid_limited.as_mut() {
+                        gl.push((idx, ac_energy));
+                    }
+                }
             }
             if dm && tariff < 0.0 && feedin > 0.0 {
                 slot_losses += feedin;
@@ -416,6 +614,9 @@ impl Evaluator {
         self.res.total_cost = numpy::nansum(&self.res.costs[..n]);
         self.res.total_losses = numpy::nansum(&self.res.losses[..n]);
         self.res.total_revenue = numpy::nansum(&self.res.revenue[..n]);
+        self.res.grid_limited = grid_limited;
+        self.res.peak_shaving = peak_shaving;
+        self.res.ev_grid_limited = ev_grid_limited;
         Ok(())
     }
 
@@ -484,8 +685,15 @@ impl Evaluator {
                 let break_even_price = charge_price / be.rt_eff + be.lcos_per_wh_dc / inv.reference_dc_to_ac_efficiency;
                 let best_uncovered_price = be.best_prices[hour];
                 if best_uncovered_price < break_even_price {
-                    let dc_wh = b.s.max_charge_power_w * rc.slot_h * ac_factor;
-                    let ac_wh = dc_wh / py_max(inv.ac_to_dc_efficiency, 1e-9);
+                    let limited =
+                        r.grid_limited.as_ref().and_then(|gl| gl.iter().find(|(s, _)| *s == hour).map(|(_, v)| *v));
+                    let ac_wh = match limited {
+                        Some(v) => v,
+                        None => {
+                            let dc_wh = b.s.max_charge_power_w * rc.slot_h * ac_factor;
+                            dc_wh / py_max(inv.ac_to_dc_efficiency, 1e-9)
+                        }
+                    };
                     let excess_cost_per_wh = break_even_price - best_uncovered_price;
                     gesamtbilanz += ac_wh * excess_cost_per_wh * be.factor;
                 }
@@ -498,21 +706,164 @@ impl Evaluator {
                 gesamtbilanz += (fc.target - reached) * fc.penalty;
             }
         }
+        if let Some(lim) = rc.inverter.as_ref().and_then(|i| i.max_grid_import_wh) {
+            let n = rc.ce.min(rc.load.len());
+            let mut excess = std::mem::take(&mut self.scratch);
+            excess.clear();
+            excess.extend(r.import[..n].iter().map(|v| v - lim).filter(|d| *d > GRID_IMPORT_LIMIT_TOLERANCE_WH));
+            let excess_wh = numpy::sum(&excess);
+            self.scratch = excess;
+            if excess_wh > 0.0 {
+                gesamtbilanz += excess_wh * rc.grid_penalty_per_wh;
+            }
+        }
         if let (Some(evp), Some(e)) = (rc.ev_penalty.as_ref(), self.ev.as_ref()) {
             let total = rc.ce.min(rc.load.len()) as i64;
+            // `_ev_soc_at_deadline`.
             let ev_soc = match evp.deadline_slot {
                 None => e.current_soc_percentage(),
                 Some(deadline) => {
                     let index = deadline;
-                    if index >= total { e.current_soc_percentage() } else { r.ev_soc[index.max(0) as usize] }
+                    if index >= total {
+                        e.current_soc_percentage()
+                    } else {
+                        let mut soc = r.ev_soc[index.max(0) as usize];
+                        let share = evp.deadline_share;
+                        if share > 0.0 && index >= 0 {
+                            // The SoC series holds the SoC at the start of each slot; after the
+                            // last slot the vehicle holds its final SoC.
+                            let soc_after = if index + 1 < total {
+                                r.ev_soc[(index + 1) as usize]
+                            } else {
+                                e.current_soc_percentage()
+                            };
+                            soc += share * (soc_after - soc);
+                        }
+                        soc
+                    }
                 }
             };
             if ev_soc < evp.min_soc {
                 gesamtbilanz += (evp.min_soc - ev_soc).abs() * evp.penalty;
             }
+            // Energy above the target is worth what the caller says it saves later, at the same
+            // moment the target is checked.
+            if evp.soc_value_steps.is_some() {
+                gesamtbilanz -= evp.soc_value_credit(e, ev_soc);
+            }
         }
         Evaluation { fitness: gesamtbilanz, extra: Some(extra) }
     }
+}
+
+/// One slot through the inverter: `process_energy`, or `_split_ev_slot_energy` for slot 0 whose
+/// EV charging falls into the part still ahead (`ev_import_extra > 0`).
+///
+/// Returns (feed-in, import, losses, `peak_shaving_ac_wh`, import the grid import limit is
+/// checked against).
+#[allow(clippy::too_many_arguments)]
+fn slot_energy(
+    inv: &Inverter,
+    rc: &RunConst,
+    bat: Option<&mut Battery>,
+    sc: &mut SelfConsumption,
+    hour: usize,
+    produced: f64,
+    consumption_without_ev: f64,
+    consumption: f64,
+    ev_import_extra: f64,
+    ev_share: f64,
+    allowed: bool,
+    export_factor: f64,
+) -> Result<(f64, f64, f64, f64, f64), SimError> {
+    if ev_import_extra > 0.0 {
+        if let Some((without_ev, with_ev)) = rc.ev_split_inverters.as_ref() {
+            return split_ev_slot_energy(
+                (without_ev, with_ev),
+                bat,
+                sc,
+                hour,
+                produced,
+                consumption_without_ev,
+                consumption - consumption_without_ev,
+                ev_share,
+                allowed,
+                export_factor,
+            );
+        }
+        return Err(SimError);
+    }
+    let (fi, gi, l, _, peak) = inv.process_energy(bat, sc, produced, consumption, hour, allowed, export_factor)?;
+    Ok((fi, gi, l, peak, gi))
+}
+
+/// `_split_ev_slot_energy`: slot 0 as a part without the EV, then a part with it; power budgets
+/// of inverter and battery and the grid import limit scaled to each part.
+#[allow(clippy::too_many_arguments)]
+fn split_ev_slot_energy(
+    parts: (&Inverter, &Inverter),
+    mut bat: Option<&mut Battery>,
+    sc: &mut SelfConsumption,
+    hour: usize,
+    energy_produced: f64,
+    consumption_without_ev_wh: f64,
+    ev_wh: f64,
+    ev_share: f64,
+    allowed: bool,
+    export_factor: f64,
+) -> Result<(f64, f64, f64, f64, f64), SimError> {
+    let (battery_slot_duration_h, charge_limit_wh, mut discharged_wh, mut charged_wh) = match bat.as_deref() {
+        Some(b) => (b.s.slot_duration_h, b.limit[hour], b.discharged[hour], b.charged[hour]),
+        None => (0.0, 0.0, 0.0, 0.0),
+    };
+    let mut totals = [0.0f64; 4];
+    let mut peak_shaving_ac_wh = 0.0;
+    let mut part_import_wh = 0.0;
+    let mut outcome: Result<(), SimError> = Ok(());
+    for (part, ev_part_wh, inv) in [(1.0 - ev_share, 0.0, parts.0), (ev_share, ev_wh, parts.1)] {
+        if part <= 0.0 {
+            continue;
+        }
+        if let Some(b) = bat.as_deref_mut() {
+            b.s.slot_duration_h = battery_slot_duration_h * part;
+            b.limit[hour] = charge_limit_wh * part;
+            let soc = b.soc_wh;
+            b.restore_slot_state(hour, (soc, 0.0, 0.0));
+        }
+        let flows = match inv.process_energy(
+            bat.as_deref_mut(),
+            sc,
+            energy_produced * part,
+            consumption_without_ev_wh * part + ev_part_wh,
+            hour,
+            allowed,
+            export_factor,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                outcome = Err(e);
+                break;
+            }
+        };
+        totals[0] += flows.0;
+        totals[1] += flows.1;
+        totals[2] += flows.2;
+        totals[3] += flows.3;
+        peak_shaving_ac_wh += flows.4;
+        if let Some(b) = bat.as_deref() {
+            discharged_wh += b.discharged[hour];
+            charged_wh += b.charged[hour];
+        }
+        part_import_wh = flows.1 / part;
+    }
+    if let Some(b) = bat.as_deref_mut() {
+        b.s.slot_duration_h = battery_slot_duration_h;
+        b.limit[hour] = charge_limit_wh;
+        let soc = b.soc_wh;
+        b.restore_slot_state(hour, (soc, discharged_wh, charged_wh));
+    }
+    outcome?;
+    Ok((totals[0], totals[1], totals[2], peak_shaving_ac_wh, part_import_wh))
 }
 
 /// `_terminal_value_credit`.

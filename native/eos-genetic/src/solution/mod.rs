@@ -92,6 +92,9 @@ fn battery_json(b: &SolarPanelBatteryParameters, tz: Option<Tz>) -> Value {
 fn ev_json(e: &ElectricVehicleParameters, tz: Option<Tz>) -> Value {
     let mut m = to_map(e);
     m.insert("min_soc_deadline_datetime".into(), device_datetime(e.min_soc_deadline_datetime.as_ref(), tz));
+    if e.charge_start_datetime.is_some() {
+        m.insert("charge_start_datetime".into(), device_datetime(e.charge_start_datetime.as_ref(), tz));
+    }
     Value::Object(m)
 }
 

@@ -5,8 +5,8 @@
 //! (`InverterParameters`) and `devices/genetic/homeappliance.py` (`HomeApplianceParameters`).
 //! Field names and defaults as in Python (`model_dump(mode="json")`), old German
 //! field names as aliases. Unknown fields are – unlike Python (`extra="forbid"`) –
-//! collected in `extra`, so that new upstream fields (e.g. `peak_shaving_threshold_w` from PR D)
-//! do not abort the run; `validate()` reports them.
+//! collected in `extra`, so that new upstream fields do not abort the parsing; `validate()`
+//! rejects them, and the run falls back to Python.
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
 use chrono_tz::Tz;
@@ -205,6 +205,14 @@ pub struct ElectricVehicleParameters {
     pub min_soc_deadline_datetime: Option<InputDateTime>,
     #[serde(default)]
     pub min_soc_max_duration_h: Option<f64>,
+    /// EV charge start (upstream #1532); not serialized when unset, so the reference
+    /// `ElectricVehicleParameters` (extra fields forbidden) validates the output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_start_datetime: Option<InputDateTime>,
+    /// Value of EV energy above the target (upstream #1532): `[[soc_percentage,
+    /// amount_per_kwh], ...]`; not serialized when unset (see above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soc_value_steps: Option<Vec<(f64, f64)>>,
     #[serde(flatten, skip_serializing)]
     pub extra: Map<String, Value>,
 }
@@ -231,6 +239,9 @@ pub struct InverterParameters {
     pub max_ac_charge_power_w: Option<f64>,
     #[serde(default)]
     pub ac_charge_limits_total_charge: bool,
+    /// Grid import limit (upstream #1531); not serialized when unset (see above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_grid_import_power_w: Option<f64>,
     #[serde(flatten, skip_serializing)]
     pub extra: Map<String, Value>,
 }
@@ -398,6 +409,16 @@ impl GeneticOptimizationParameters {
                 validate_efficiency_curve(curve)?;
             }
         }
+        if let Some(ev) = &self.ev {
+            if let Some(steps) = &ev.soc_value_steps {
+                validate_soc_value_steps(steps)?;
+                if let Some(&(_, first_amount)) = steps.first() {
+                    if !(ev.capacity_wh as f64 / 1000.0 * first_amount).is_finite() {
+                        return Err("soc_value_steps amounts are too large for the vehicle capacity.".into());
+                    }
+                }
+            }
+        }
         for (name, extra) in [
             ("pv_battery", self.pv_battery.as_ref().map(|b| &b.extra)),
             ("ev", self.ev.as_ref().map(|b| &b.extra)),
@@ -419,6 +440,30 @@ impl GeneticOptimizationParameters {
         }
         Ok(())
     }
+}
+
+/// `devicesabc.validate_soc_value_steps` (check only): SoC finite in ]0, 100] and strictly
+/// increasing, amounts finite, >= 0 and not rising.
+pub fn validate_soc_value_steps(steps: &[(f64, f64)]) -> Result<(), String> {
+    let mut previous: Option<(f64, f64)> = None;
+    for &(soc, amount) in steps {
+        if !soc.is_finite() || !(0.0 < soc && soc <= 100.0) {
+            return Err(format!("SoC value step state of charge {soc} is outside of ]0, 100]."));
+        }
+        if !amount.is_finite() || amount < 0.0 {
+            return Err(format!("SoC value step amount {amount} is negative or not finite."));
+        }
+        if let Some((previous_soc, previous_amount)) = previous {
+            if soc <= previous_soc {
+                return Err("SoC value step states of charge must be strictly increasing.".into());
+            }
+            if amount > previous_amount {
+                return Err("SoC value step amounts must not rise with the state of charge.".into());
+            }
+        }
+        previous = Some((soc, amount));
+    }
+    Ok(())
 }
 
 /// `devicesabc.validate_efficiency_curve` (check only, no transformation).

@@ -1,10 +1,14 @@
-//! `devices/genetic/inverter.py` – `Inverter` with efficiency curve and AC charging; plus `devicesabc.interpolate_efficiency_curve` and
+//! `devices/genetic/inverter.py` – `Inverter` with efficiency curve, AC charging and
+//! grid import limit; plus `devicesabc.interpolate_efficiency_curve` and
 //! `devicesabc.solve_ac_for_dc_energy`.
 
 use super::battery::{Battery, SimError};
 use crate::numpy::{bisect_left, py_max, py_min};
 use crate::params::InverterParameters;
 use crate::selfconsumption::SelfConsumption;
+
+/// Import above the grid import limit only counts beyond this rounding margin [Wh].
+pub const GRID_IMPORT_LIMIT_TOLERANCE_WH: f64 = 1e-6;
 
 /// `devicesabc.interpolate_efficiency_curve`.
 pub fn interpolate_efficiency_curve(fx: &[f64], fy: &[f64], load_fraction: f64) -> f64 {
@@ -84,6 +88,9 @@ pub struct Inverter {
     pub reference_dc_to_ac_efficiency: f64,
     pub max_ac_charge_power_w: Option<f64>,
     pub ac_charge_limits_total_charge: bool,
+    /// `max_grid_import_wh`: the grid import limit per slot [Wh]; with it, a battery the plan
+    /// holds covers the import above it (threshold peak shaving).
+    pub max_grid_import_wh: Option<f64>,
 }
 
 impl Inverter {
@@ -105,6 +112,7 @@ impl Inverter {
             reference_dc_to_ac_efficiency: 0.0,
             max_ac_charge_power_w: p.max_ac_charge_power_w,
             ac_charge_limits_total_charge: p.ac_charge_limits_total_charge,
+            max_grid_import_wh: p.max_grid_import_power_w.map(|w| w * slot_duration_h),
         };
         inv.reference_dc_to_ac_efficiency =
             inv.dc_to_ac_efficiency_at(p.dc_to_ac_efficiency_reference_load_fraction * inv.max_power_wh);
@@ -171,32 +179,95 @@ impl Inverter {
         }
     }
 
-    /// `charge_battery_from_grid(hour, factor)` → (AC energy, losses).
-    pub fn charge_battery_from_grid(
+    /// `grid_limited_ac_charge_factor(hour, factor, slot_grid_import_wh)`.
+    pub fn grid_limited_ac_charge_factor(&self, bat: &Battery, hour: usize, factor: f64, slot_import: f64) -> f64 {
+        let max_grid_import_wh = match self.max_grid_import_wh {
+            Some(v) => v,
+            None => return factor,
+        };
+        if factor <= 0.0 {
+            return factor;
+        }
+        let headroom_ac_wh = max_grid_import_wh - slot_import;
+        let headroom_dc_wh = if headroom_ac_wh > 0.0 { headroom_ac_wh * self.ac_to_dc_efficiency } else { 0.0 };
+        if !self.ac_charge_limits_total_charge
+            && bat.s.max_charge_power_w * self.slot_duration_h * factor <= headroom_dc_wh
+        {
+            return factor;
+        }
+        let budget_wh = bat.remaining_charge_budget_wh(hour);
+        if self.ac_charge_limits_total_charge {
+            if budget_wh <= headroom_dc_wh {
+                return factor;
+            }
+            let rated_wh = bat.s.max_charge_power_w * self.slot_duration_h;
+            return (rated_wh * factor - budget_wh + headroom_dc_wh) / rated_wh;
+        }
+        if budget_wh * factor <= headroom_dc_wh {
+            return factor;
+        }
+        headroom_dc_wh / budget_wh
+    }
+
+    /// `charge_battery_from_grid_executed(hour, factor, slot_grid_import_wh)` →
+    /// (AC energy, losses, executed factor).
+    pub fn charge_battery_from_grid_executed(
         &self,
         bat: &mut Battery,
         hour: usize,
         factor: f64,
-    ) -> Result<(f64, f64), SimError> {
+        slot_import: Option<f64>,
+    ) -> Result<(f64, f64, f64), SimError> {
         if factor <= 0.0 {
-            return Ok((0.0, 0.0));
+            return Ok((0.0, 0.0, factor));
+        }
+        let mut factor = factor;
+        let rated_wh = bat.s.max_charge_power_w * self.slot_duration_h;
+        let mut rated_reading_exceeds = false;
+        if let Some(max_grid_import_wh) = self.max_grid_import_wh {
+            let slot_import = slot_import.ok_or(SimError)?;
+            let headroom_ac_wh = max_grid_import_wh - slot_import;
+            let headroom_dc_wh = if headroom_ac_wh > 0.0 { headroom_ac_wh * self.ac_to_dc_efficiency } else { 0.0 };
+            rated_reading_exceeds = !self.ac_charge_limits_total_charge && rated_wh * factor > headroom_dc_wh;
+            let limited = self.grid_limited_ac_charge_factor(bat, hour, factor, slot_import);
+            if limited <= 0.0 {
+                return Ok((0.0, 0.0, 0.0));
+            }
+            if limited < factor {
+                if self.ac_charge_limits_total_charge {
+                    bat.limit_slot_charge(hour, rated_wh * limited);
+                }
+                factor = limited;
+            }
         }
         let (stored, battery_losses) = if self.ac_charge_limits_total_charge {
-            bat.charge_energy(Some(bat.s.max_charge_power_w * self.slot_duration_h * factor), hour, 0.0)?
+            bat.charge_energy(Some(rated_wh * factor), hour, 0.0)?
         } else {
             bat.charge_energy(None, hour, factor)?
         };
         let dc_energy = stored + battery_losses;
         let ac_energy = dc_energy / self.ac_to_dc_efficiency;
-        Ok((ac_energy, battery_losses + (ac_energy - dc_energy)))
+        if rated_reading_exceeds {
+            factor = if rated_wh > 0.0 { dc_energy / rated_wh } else { 0.0 };
+        }
+        Ok((ac_energy, battery_losses + (ac_energy - dc_energy), factor))
     }
 
-    /// `_discharge_battery_to_ac(requested_ac_wh, hour)` (single battery).
-    pub fn discharge_battery_to_ac(&self, bat: &mut Battery, requested_ac_wh: f64, hour: usize) -> (f64, f64) {
+    /// `_discharge_battery_to_ac(requested_ac_wh, hour, ignore_hold)` (single battery).
+    ///
+    /// `ignore_hold` discharges also in a slot the plan holds the battery (threshold peak
+    /// shaving at the grid import limit).
+    pub fn discharge_battery_to_ac(
+        &self,
+        bat: &mut Battery,
+        requested_ac_wh: f64,
+        hour: usize,
+        ignore_hold: bool,
+    ) -> (f64, f64) {
         if requested_ac_wh <= 0.0 {
             return (0.0, 0.0);
         }
-        if bat.discharge_array[hour] == 0.0 {
+        if bat.discharge_array[hour] == 0.0 && !ignore_hold {
             return (0.0, 0.0);
         }
         let dc_to_ac_efficiency =
@@ -232,7 +303,7 @@ impl Inverter {
         (battery_discharge_ac, discharge_losses + inverter_discharge_losses)
     }
 
-    /// `process_energy(...)` → (feed-in, import, losses, self-consumption).
+    /// `process_energy(...)` → (feed-in, import, losses, self-consumption, `peak_shaving_ac_wh`).
     #[allow(clippy::too_many_arguments)]
     pub fn process_energy(
         &self,
@@ -243,7 +314,7 @@ impl Inverter {
         hour: usize,
         allow_battery_grid_export: bool,
         battery_grid_export_factor: f64,
-    ) -> Result<(f64, f64, f64, f64), SimError> {
+    ) -> Result<(f64, f64, f64, f64, f64), SimError> {
         let mut losses = 0.0;
         let mut grid_export = 0.0;
         let mut generation = generation;
@@ -287,20 +358,50 @@ impl Inverter {
             remaining_cap = 0.0;
         }
         let mut battery_discharge_ac = 0.0;
+        // `peak_shaving_ac_wh`: AC energy a held battery delivered for threshold peak shaving.
+        let mut peak_shaving_ac_wh = 0.0;
         if remaining_load > 0.0 && remaining_cap > 0.0 {
             if let Some(b) = bat.as_deref_mut() {
-                let requested = if remaining_cap < remaining_load { remaining_cap } else { remaining_load };
-                let (ac, l) = self.discharge_battery_to_ac(b, requested, hour);
-                battery_discharge_ac = ac;
-                remaining_load -= ac;
-                if remaining_load < 0.0 {
-                    remaining_load = 0.0;
+                match self.max_grid_import_wh {
+                    // `battery.discharge_released(hour)` is `discharge_array[hour] != 0`.
+                    Some(lim) if b.discharge_array[hour] == 0.0 => {
+                        // Threshold peak shaving: a battery the plan holds covers only the
+                        // import above the grid import limit.
+                        let excess_wh = remaining_load - lim;
+                        if excess_wh > 0.0 {
+                            let requested = if remaining_cap < excess_wh { remaining_cap } else { excess_wh };
+                            let (ac, l) = self.discharge_battery_to_ac(b, requested, hour, true);
+                            battery_discharge_ac = ac;
+                            peak_shaving_ac_wh = ac;
+                            if ac >= excess_wh * (1.0 - 1e-12) {
+                                // Shaved completely: the import is the limit, without a
+                                // rounding residue that would read as AC charge headroom.
+                                remaining_load = lim;
+                            } else {
+                                remaining_load -= ac;
+                            }
+                            remaining_cap -= ac;
+                            if remaining_cap < 0.0 {
+                                remaining_cap = 0.0;
+                            }
+                            losses += l;
+                        }
+                    }
+                    _ => {
+                        let requested = if remaining_cap < remaining_load { remaining_cap } else { remaining_load };
+                        let (ac, l) = self.discharge_battery_to_ac(b, requested, hour, false);
+                        battery_discharge_ac = ac;
+                        remaining_load -= ac;
+                        if remaining_load < 0.0 {
+                            remaining_load = 0.0;
+                        }
+                        remaining_cap -= ac;
+                        if remaining_cap < 0.0 {
+                            remaining_cap = 0.0;
+                        }
+                        losses += l;
+                    }
                 }
-                remaining_cap -= ac;
-                if remaining_cap < 0.0 {
-                    remaining_cap = 0.0;
-                }
-                losses += l;
             }
         }
         let grid_import = remaining_load;
@@ -348,11 +449,11 @@ impl Inverter {
                 if rated_export_ac < export_capacity {
                     export_capacity = rated_export_ac;
                 }
-                let (eac, el) = self.discharge_battery_to_ac(b, export_capacity, hour);
+                let (eac, el) = self.discharge_battery_to_ac(b, export_capacity, hour, false);
                 grid_export += eac;
                 losses += el;
             }
         }
-        Ok((grid_export, grid_import, losses, direct_pv_energy + battery_discharge_ac))
+        Ok((grid_export, grid_import, losses, direct_pv_energy + battery_discharge_ac, peak_shaving_ac_wh))
     }
 }

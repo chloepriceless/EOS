@@ -19,12 +19,12 @@ use chrono_tz::Tz;
 use crate::curves::{self, TailPlanSlot, TailTrace, ValueCurve};
 use crate::devices::battery::{Battery, BatterySpec};
 use crate::devices::homeappliance::{self, ApplianceGene, HomeAppliance, StartDecoder, add_seconds, total_seconds};
-use crate::devices::inverter::Inverter;
+use crate::devices::inverter::{GRID_IMPORT_LIMIT_TOLERANCE_WH, Inverter};
 use crate::numpy::{self, NumericProfile, py_max, py_min};
 use crate::params::{FeedInTariff, GeneticOptimizationParameters};
 use crate::pyrandom::PyRandom;
 use crate::selfconsumption::SelfConsumption;
-use crate::settings::{RunConfig, TerminalValueMode};
+use crate::settings::{GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH, RunConfig, TerminalValueMode};
 use crate::simulation::{
     BreakEven, DecodeTable, EvPenalty, Evaluation, Evaluator, FullCharge, RunConst, SimResult, Terminal,
     terminal_credit,
@@ -62,6 +62,8 @@ const IMMIGRANT_PROTECTION_GENERATIONS: i64 = 2;
 const IMMIGRANT_PROTECTION_FRACTION: f64 = 0.25;
 const SOFT_RESTART_SURVIVOR_FRACTION: f64 = 0.20;
 const POINT_MUTATION_EXPECTED_GENES: f64 = 3.0;
+const EV_SHIFT_MUTATION_PROBABILITY: f64 = 0.50;
+const EV_SHIFT_MAX_SLOTS: i64 = 8;
 
 /// An individual (DEAP `creator.Individual`).
 #[derive(Debug, Clone)]
@@ -373,7 +375,15 @@ pub struct Optimizer<'a> {
     bat_possible_charge_values: Vec<f64>,
     bat_possible_grid_export_values: Vec<f64>,
     ev_possible_charge_values: Vec<f64>,
+    ev_first_charge_slot: usize,
     ev_soc_deadline_slot: Option<i64>,
+    /// `_ev_soc_deadline_share`: part of the deadline slot's charge that counts at the deadline.
+    ev_soc_deadline_share: f64,
+    /// `_ev_first_slot_share`: part of slot 0 still ahead of the run.
+    ev_first_slot_share: f64,
+    ev_target_soc_percentage: Option<f64>,
+    /// `_ev_soc_value_steps`: value of EV energy above the target as (SoC %, amount/kWh) steps.
+    ev_soc_value_steps: Option<Vec<(f64, f64)>>,
     layout: StateLayout,
     mutation_probability: f64,
     // Simulation series (truncated to the control horizon)
@@ -542,7 +552,9 @@ impl<'a> Optimizer<'a> {
         let mut g: Vec<i64> = (0..ce).map(|_| self.rng.randint(0, total - 1)).collect();
         if self.optimize_ev {
             let n = self.ev_possible_charge_values.len() as i64;
-            g.extend((0..ce).map(|_| self.rng.randint(0, n - 1)));
+            let mut ev: Vec<i64> = (0..ce).map(|_| self.rng.randint(0, n - 1)).collect();
+            self.clear_ev_genes_before_charge_start(&mut ev);
+            g.extend(ev);
         }
         for i in 0..self.rc.layout.len() {
             let n = self.rc.layout[i].allowed_start_slots.len() as i64;
@@ -562,6 +574,25 @@ impl<'a> Optimizer<'a> {
         }
         let zi = py_argmin_by(&(0..rates.len()).collect::<Vec<_>>(), |&i| rates[i].abs());
         if rates[zi].abs() > 1e-12 { None } else { Some(zi) }
+    }
+
+    /// `_clear_ev_genes_before_charge_start(ev_genes)`.
+    fn clear_ev_genes_before_charge_start(&self, ev: &mut [i64]) -> bool {
+        let first = self.ev_first_charge_slot;
+        if first == 0 {
+            return false;
+        }
+        let Some(zero) = self.ev_zero_index() else {
+            return false;
+        };
+        let mut changed = false;
+        for slot in 0..first.min(ev.len()) {
+            if ev[slot] != zero as i64 {
+                ev[slot] = zero as i64;
+                changed = true;
+            }
+        }
+        changed
     }
 
     // ------------------------------------------------------------------ Mutation
@@ -611,20 +642,92 @@ impl<'a> Optimizer<'a> {
         changed
     }
 
-    fn mutate_ev_controls(&mut self, ind: &mut [i64]) -> bool {
+    fn ev_first_charge_gene_slot(&self) -> usize {
+        self.ev_first_charge_slot
+    }
+
+    /// `_ev_deadline_end_slot()`: end (exclusive) of the slots whose EV charge counts at the
+    /// deadline; a deadline inside a slot includes that slot.
+    fn ev_deadline_end_slot(&self) -> Option<i64> {
+        let d = self.ev_soc_deadline_slot?;
+        Some(if self.ev_soc_deadline_share > 0.0 { d + 1 } else { d })
+    }
+
+    /// `_ev_counted_share(slot)`.
+    fn ev_counted_share(&self, slot: usize) -> f64 {
+        if self.ev_soc_deadline_slot == Some(slot as i64) { self.ev_soc_deadline_share } else { 1.0 }
+    }
+
+    /// `_ev_slot_time_share(slot)`.
+    fn ev_slot_time_share(&self, slot: usize) -> f64 {
+        if slot == 0 { self.ev_first_slot_share } else { 1.0 }
+    }
+
+    fn mutate_ev_controls(&mut self, ind: &mut Vec<i64>) -> bool {
+        let try_shift = self.rng.random() < EV_SHIFT_MUTATION_PROBABILITY;
+        if try_shift && self.mutate_ev_shift(ind) {
+            return true;
+        }
         let ce = self.ce;
+        let ev_start = ce + self.ev_first_charge_gene_slot();
+        let ev_end = ce * 2;
         let n = self.ev_possible_charge_values.len() as i64;
-        let mut part: Vec<i64> = ind[ce..ce * 2].to_vec();
+        if ev_start > ev_end {
+            return false;
+        }
+        let mut part: Vec<i64> = ind[ev_start..ev_end].to_vec();
         let before = part.clone();
         self.mut_uniform_int(&mut part, 0, n - 1);
         if part == before {
             self.force_segment_change(&mut part, 0, n - 1);
         }
         if part != before {
-            ind[ce..ce * 2].copy_from_slice(&part);
+            ind[ev_start..ev_end].copy_from_slice(&part);
             return true;
         }
         false
+    }
+
+    fn mutate_ev_shift(&mut self, ind: &mut [i64]) -> bool {
+        let start = self.ev_first_charge_gene_slot() as i64;
+        let mut end = self.ce as i64;
+        if let Some(d) = self.ev_deadline_end_slot() {
+            end = end.min(d);
+        }
+        let span = end - start;
+        if span < 2 {
+            return false;
+        }
+        let off = self.ce as i64;
+        let rates = &self.ev_possible_charge_values;
+        let nr = rates.len() as i64;
+        let charging: Vec<i64> = (start..end)
+            .filter(|&s| {
+                let v = ind[(off + s) as usize];
+                0 <= v && v < nr && rates[v as usize] > 0.0
+            })
+            .collect();
+        if charging.is_empty() {
+            return false;
+        }
+        let length = self.rng.randint(1, 1.max(EV_SHIFT_MAX_SLOTS.min(span / 2)));
+        let pick = charging[self.rng.choice_index(charging.len())];
+        let source = pick.min(end - length);
+        let targets: Vec<i64> =
+            (start..end - length + 1).filter(|&s| s + length <= source || s >= source + length).collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let target = targets[self.rng.choice_index(targets.len())];
+        let (s0, t0, l) = ((off + source) as usize, (off + target) as usize, length as usize);
+        let src: Vec<i64> = ind[s0..s0 + l].to_vec();
+        let tgt: Vec<i64> = ind[t0..t0 + l].to_vec();
+        if src == tgt {
+            return false;
+        }
+        ind[s0..s0 + l].copy_from_slice(&tgt);
+        ind[t0..t0 + l].copy_from_slice(&src);
+        true
     }
 
     fn mutate_battery_block(&mut self, ind: &mut [i64]) {
@@ -785,13 +888,19 @@ impl<'a> Optimizer<'a> {
         let Some(ev) = self.rc.ev.as_ref() else {
             return schedule;
         };
-        // As in Python: the EV battery's own minimum SoC.
-        let required = py_max(ev.min_soc_wh - ev.capacity_wh * ev.initial_soc_percentage / 100.0, 0.0);
-        if required <= 0.0 {
+        // The target is the requested EV SoC, not the EV battery's own minimum SoC (always 0 %).
+        let Some(target) = self.ev_target_soc_percentage else {
+            return schedule;
+        };
+        let target = py_min(target, ev.max_soc_percentage);
+        let required = py_max(ev.capacity_wh * (target - ev.initial_soc_percentage) / 100.0, 0.0);
+        let value_steps = self.ev_soc_value_steps.as_deref().filter(|steps| !steps.is_empty());
+        if required <= 0.0 && value_steps.is_none() {
             return schedule;
         }
         let mut end = self.ce as i64;
-        if let Some(d) = self.ev_soc_deadline_slot {
+        if let Some(d) = self.ev_deadline_end_slot() {
+            // Of a deadline slot only the share before the deadline counts.
             end = 0.max(end.min(d));
         }
         let prices = &self.prices;
@@ -802,7 +911,7 @@ impl<'a> Optimizer<'a> {
             let surplus = pv[slot] - load[slot];
             if prefer_pv && surplus > 0.0 { (feed_in[slot], -surplus) } else { (prices[slot], -surplus) }
         };
-        let mut candidates: Vec<usize> = (0..end.max(0) as usize).collect();
+        let mut candidates: Vec<usize> = (self.ev_first_charge_gene_slot()..end.max(0) as usize).collect();
         candidates.sort_by(|&a, &b| cmp_f64_pair(marginal(a), marginal(b)));
         let mut positive: Vec<(f64, usize)> =
             rates.iter().enumerate().filter(|(_, r)| **r > 0.0).map(|(i, r)| (*r, i)).collect();
@@ -812,17 +921,76 @@ impl<'a> Optimizer<'a> {
         }
         let max_stored = ev.max_charge_power_w * self.slot_h * ev.charging_efficiency;
         let mut remaining = required;
-        for slot in candidates {
-            let required_rate = remaining / py_max(max_stored, 1e-9);
-            let (rate, idx) =
-                positive.iter().find(|it| it.0 >= required_rate).copied().unwrap_or(positive[positive.len() - 1]);
-            schedule[slot] = idx as i64;
-            remaining -= max_stored * rate;
-            if remaining <= 1e-9 {
-                break;
+        let mut seeded = 0.0;
+        if remaining > 0.0 {
+            for &slot in &candidates {
+                let counted_wh = max_stored * self.ev_slot_time_share(slot) * self.ev_counted_share(slot);
+                let required_rate = remaining / py_max(counted_wh, 1e-9);
+                let (rate, idx) =
+                    positive.iter().find(|it| it.0 >= required_rate).copied().unwrap_or(positive[positive.len() - 1]);
+                schedule[slot] = idx as i64;
+                remaining -= counted_wh * rate;
+                seeded += counted_wh * rate;
+                if remaining <= 1e-9 {
+                    break;
+                }
+            }
+        }
+        if let Some(steps) = value_steps {
+            // Beyond the target: full power in the cheapest free slots as long as a slot costs
+            // less per stored kWh than the next stored kWh is worth. With direct marketing an
+            // export at a negative tariff is curtailed, so the surplus then costs nothing.
+            let target_soc = self.ev_heuristic_target_soc(ev);
+            let curtails_negative = self.rc.direct_marketing;
+            let (full_rate, full_index) = positive[positive.len() - 1];
+            let full_ac_wh = ev.max_charge_power_w * self.slot_h * full_rate;
+            let fill_cost_wh = |slot: usize| -> f64 {
+                // The current slot is only charged for the rest of it; its surplus forecast
+                // stays the whole slot's.
+                let slot_ac_wh = full_ac_wh * self.ev_slot_time_share(slot);
+                let surplus_wh = if prefer_pv { py_min(py_max(pv[slot] - load[slot], 0.0), slot_ac_wh) } else { 0.0 };
+                let surplus_price = if curtails_negative { py_max(feed_in[slot], 0.0) } else { feed_in[slot] };
+                surplus_wh * surplus_price + (slot_ac_wh - surplus_wh) * prices[slot]
+            };
+            // `fill_cost_per_counted_wh`: a deadline slot costs the whole slot but counts only its
+            // share; the current slot costs and stores only its rest.
+            let fill_cost_per_counted_wh = |slot: usize| -> f64 {
+                let counted = self.ev_counted_share(slot) * self.ev_slot_time_share(slot);
+                fill_cost_wh(slot) / py_max(counted, 1e-9)
+            };
+            // Stable sort by the cost per counted energy of a full-power slot: equal costs keep
+            // the candidate order.
+            let mut free: Vec<(usize, f64)> = candidates
+                .iter()
+                .filter(|&&slot| schedule[slot] == zero_index)
+                .map(|&slot| (slot, fill_cost_per_counted_wh(slot)))
+                .collect();
+            free.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut soc = ev.initial_soc_percentage + seeded / ev.capacity_wh * 100.0;
+            for (slot, cost) in free {
+                if soc >= ev.max_soc_percentage - 1e-9 {
+                    break;
+                }
+                let value_per_wh = ev_soc_value_per_wh(
+                    steps,
+                    py_max(soc, target_soc),
+                    ev.max_soc_percentage,
+                    self.ev_target_soc_percentage,
+                );
+                if cost >= value_per_wh * full_ac_wh * ev.charging_efficiency {
+                    break;
+                }
+                schedule[slot] = full_index as i64;
+                let counted_wh = max_stored * full_rate * self.ev_slot_time_share(slot) * self.ev_counted_share(slot);
+                soc += counted_wh / ev.capacity_wh * 100.0;
             }
         }
         schedule
+    }
+
+    /// `min(_ev_target_soc_percentage, ev.max_soc_percentage)` of the seeding heuristic.
+    fn ev_heuristic_target_soc(&self, ev: &BatterySpec) -> f64 {
+        py_min(self.ev_target_soc_percentage.unwrap_or(0.0), ev.max_soc_percentage)
     }
 
     fn heuristic_appliance_genes(&self) -> Vec<i64> {
@@ -882,6 +1050,167 @@ impl<'a> Optimizer<'a> {
             }
             if viable >= max_sources {
                 break;
+            }
+        }
+        candidates
+    }
+
+    /// `_grid_limit_ev_shift_candidates(individual, max_sources)`: candidates that move EV
+    /// charging the grid import limit cut to other slots with room.
+    fn grid_limit_ev_shift_candidates(&mut self, ind: &[i64], max_sources: usize) -> Vec<Vec<i64>> {
+        let Some(max_grid_import_wh) = self.rc.inverter.as_ref().and_then(|i| i.max_grid_import_wh) else {
+            return Vec::new();
+        };
+        let Some(ev) = self.rc.ev.clone() else {
+            return Vec::new();
+        };
+        if !self.optimize_ev || self.ev_possible_charge_values.is_empty() {
+            return Vec::new();
+        }
+        let rates = self.ev_possible_charge_values.clone();
+        let nr = rates.len() as i64;
+        // Python list indexing (a negative index counts from the end).
+        let rate_at = |index: i64| -> Option<f64> {
+            let i = if index < 0 { index + nr } else { index };
+            if 0 <= i && i < nr { Some(rates[i as usize]) } else { None }
+        };
+        let ce = self.ce;
+        let ev_genes: Vec<i64> = ind[ce..ce * 2].to_vec();
+        if !ev_genes.iter().any(|&index| rate_at(index).is_some_and(|r| r > 0.0)) {
+            return Vec::new();
+        }
+        // Simulate a copy: the evaluation may rewrite genes in place.
+        let mut simulated_genes = ind.to_vec();
+        if self.evaluators[0].evaluate_inner(&self.rc, &mut simulated_genes).is_err() {
+            return Vec::new();
+        }
+        let res = &self.evaluators[0].res;
+        let n = ce.min(self.rc.load.len());
+        let imports: Vec<f64> = res.import[..n].to_vec();
+        let exports: Vec<f64> = res.feedin[..n].to_vec();
+        let executed: HashMap<usize, f64> =
+            res.ev_grid_limited.as_ref().map(|gl| gl.iter().copied().collect()).unwrap_or_default();
+        let end_slot = n;
+        let slot_room = |slot: usize, pv_credit: bool| -> f64 {
+            let mut room_wh = max_grid_import_wh - imports[slot];
+            if pv_credit {
+                room_wh += exports[slot];
+            }
+            room_wh
+        };
+        let mut sources: Vec<usize> = (0..end_slot)
+            .filter(|slot| executed.get(slot).is_some_and(|&rate| rate_at(ev_genes[*slot]).is_some_and(|r| r > rate)))
+            .collect();
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        let cut = |slot: usize| rate_at(ev_genes[slot]).unwrap_or(0.0) - executed[&slot];
+        sources.sort_by(|&a, &b| cmp_f64_pair((-cut(a), a as f64), (-cut(b), b as f64)));
+
+        // Rate indices in ascending order of the rate (stable): one step down / up.
+        let mut ordered: Vec<usize> = (0..rates.len()).collect();
+        ordered.sort_by(|&a, &b| rates[a].partial_cmp(&rates[b]).unwrap_or(std::cmp::Ordering::Equal));
+        let mut position = vec![0usize; rates.len()];
+        for (rank, &index) in ordered.iter().enumerate() {
+            position[index] = rank;
+        }
+        let executed_index = |slot: usize| -> usize {
+            let rate = executed[&slot];
+            ordered.iter().copied().rev().find(|&index| rates[index] <= rate + 1e-12).unwrap_or(ordered[0])
+        };
+        let rated_wh = ev.max_charge_power_w * self.slot_h;
+        let prices = &self.prices;
+        let charge_end_slot = end_slot;
+        let deadline_slot = self.ev_soc_deadline_slot;
+        let first_target_slot = self.ev_first_charge_slot;
+        let first_slot_share = ev.first_slot_share;
+        let slot_energy_wh = |slot: usize| if slot == 0 { rated_wh * first_slot_share } else { rated_wh };
+
+        // `move`: lower the source to its executed rate and refill elsewhere.
+        let do_move = |ev_values: &mut Vec<i64>,
+                       room: &mut HashMap<usize, f64>,
+                       source: usize,
+                       pv_credit: bool,
+                       exact: bool|
+         -> bool {
+            let lowered = executed_index(source);
+            let current = ev_values[source] as usize;
+            if position[lowered] >= position[current] {
+                return false;
+            }
+            let removed_wh = (rates[current] - executed[&source]) * slot_energy_wh(source);
+            ev_values[source] = lowered as i64;
+            room.entry(source).or_insert_with(|| slot_room(source, pv_credit));
+            let mut target_end = charge_end_slot;
+            if let Some(d) = deadline_slot {
+                if (source as i64) < d {
+                    target_end = target_end.min(d.max(0) as usize);
+                }
+            }
+            let mut targets: Vec<usize> = (first_target_slot..target_end.max(first_target_slot))
+                .filter(|&slot| slot != source && !(slot == 0 && first_slot_share < 1.0))
+                .collect();
+            targets.sort_by(|&a, &b| cmp_f64_pair((prices[a], a as f64), (prices[b], b as f64)));
+            let mut refilled_wh = 0.0;
+            let overshoots: &[bool] = if exact { &[false, true] } else { &[true] };
+            for &overshoot in overshoots {
+                for &target in &targets {
+                    while refilled_wh < removed_wh - 1e-9 {
+                        let current_target = ev_values[target] as usize;
+                        let target_rank = position[current_target];
+                        if target_rank + 1 >= ordered.len() {
+                            break;
+                        }
+                        let raised = ordered[target_rank + 1];
+                        let added_wh = (rates[raised] - rates[current_target]) * rated_wh;
+                        if !overshoot && added_wh > removed_wh - refilled_wh + 1e-9 {
+                            break;
+                        }
+                        let free_wh = room.get(&target).copied().unwrap_or_else(|| slot_room(target, pv_credit));
+                        if added_wh > free_wh + GRID_IMPORT_LIMIT_TOLERANCE_WH {
+                            break;
+                        }
+                        ev_values[target] = raised as i64;
+                        room.insert(target, free_wh - added_wh);
+                        refilled_wh += added_wh;
+                        if overshoot && exact {
+                            break;
+                        }
+                    }
+                    if refilled_wh >= removed_wh - 1e-9 {
+                        return true;
+                    }
+                }
+            }
+            true
+        };
+
+        let battery_genes = &ind[..ce];
+        let appliance_genes = &ind[ce * 2..];
+        let mut candidates: Vec<Vec<i64>> = Vec::new();
+        let mut seen: HashSet<Vec<i64>> = HashSet::default();
+        seen.insert(ind.to_vec());
+        let mut add = |ev_values: &[i64]| {
+            let mut candidate = Vec::with_capacity(ind.len());
+            candidate.extend_from_slice(battery_genes);
+            candidate.extend_from_slice(ev_values);
+            candidate.extend_from_slice(appliance_genes);
+            if seen.insert(candidate.clone()) {
+                candidates.push(candidate);
+            }
+        };
+        for pv_credit in [true, false] {
+            for exact in [true, false] {
+                let mut combined = ev_genes.clone();
+                let mut combined_room: HashMap<usize, f64> = HashMap::default();
+                for &source in sources.iter().take(max_sources) {
+                    let mut single = ev_genes.clone();
+                    if do_move(&mut single, &mut HashMap::default(), source, pv_credit, exact) {
+                        add(&single);
+                    }
+                    do_move(&mut combined, &mut combined_room, source, pv_credit, exact);
+                }
+                add(&combined);
             }
         }
         candidates
@@ -1497,7 +1826,8 @@ impl<'a> Optimizer<'a> {
         let mut improvements = 0i64;
         for _ in 0..LOCAL_SEARCH_MAX_PASSES {
             let mut pass_best: Option<Ind> = None;
-            let cands = self.grid_export_shift_candidates(&best.genes, 6);
+            let mut cands = self.grid_export_shift_candidates(&best.genes, 6);
+            cands.extend(self.grid_limit_ev_shift_candidates(&best.genes, 6));
             for genome in cands {
                 if evaluations >= max_evaluations {
                     break;
@@ -1605,9 +1935,15 @@ pub fn build<'a>(
     let battery = params.pv_battery.as_ref().map(|p| BatterySpec::from_pv(p, slot_h));
     let ev = params.ev.as_ref().map(|p| BatterySpec::from_ev(p, slot_h));
     let mut optimize_ev = false;
+    let mut ev_target = None;
     let mut ev_rates: Vec<f64> = vec![1.0];
+    let mut ev_value_steps: Option<Vec<(f64, f64)>> = None;
     if let Some(p) = &params.ev {
-        optimize_ev = p.min_soc_percentage > p.initial_soc_percentage;
+        // A vehicle at its target is only planned when energy above the target has a value it
+        // can still gain (`_ev_soc_value_headroom`).
+        optimize_ev = p.min_soc_percentage > p.initial_soc_percentage || ev_soc_value_headroom(p);
+        ev_target = Some(p.min_soc_percentage as f64);
+        ev_value_steps = p.soc_value_steps.clone().filter(|steps| !steps.is_empty());
         ev_rates = if let Some(r) = &p.charge_rates {
             r.clone()
         } else if let Some(r) = &cfg.fallback_ev_charge_rates {
@@ -1652,25 +1988,81 @@ pub fn build<'a>(
         StartDecoder::default().decode(&layout, &appliances, &mut probe, slot_h, ce)?;
     }
 
-    // EV deadline
+    // EV: charge start and deadline
     let slot_seconds = slot_h * 3600.0;
-    if ce == 0 {
+    let observation_ts = cfg.observation_datetime.timestamp() as f64
+        + f64::from(cfg.observation_datetime.timestamp_subsec_nanos()) / 1e9;
+    // `_now_position()`: now in slots relative to slot 0 (fractional, at least the control start).
+    let now_position = py_max(0.0, total_seconds(&cfg.observation_datetime, &slot0) / (slot_h * 3600.0));
+    // `_current_slot_share()`: part of slot 0 still ahead of now, in ]0, 1].
+    let current_slot_share = py_min(py_max(1.0 - (now_position - 0.0), 1e-6), 1.0);
+    // `_ev_charge_start_position`: not clamped (a charge start in the past is negative).
+    let ev_charge_start_position: Option<f64> = params.ev.as_ref().and_then(|p| {
+        let cs = p.charge_start_datetime.as_ref()?;
+        let seconds = total_seconds(&cs.resolve(cfg.timezone), &slot0);
+        Some(seconds / (slot_h * 3600.0))
+    });
+    // `_ev_charge_start_slot`.
+    let mut ev_first = 0usize;
+    if let (Some(position), Some(cs)) =
+        (ev_charge_start_position, params.ev.as_ref().and_then(|p| p.charge_start_datetime.as_ref()))
+    {
+        if cs.timestamp_f64(cfg.timezone) > observation_ts {
+            // The first slot that begins at or after the charge start.
+            let charge_start_slot = (position - 1e-9).ceil() as i64;
+            ev_first = charge_start_slot.max(0).min(ce as i64) as usize;
+        }
+    }
+    if optimize_ev && ev_first >= ce {
         optimize_ev = false;
     }
-    let ev_deadline: Option<i64> = params.ev.as_ref().and_then(|p| {
-        let mut cands: Vec<i64> = Vec::new();
+    // `_ev_deadline`: (slot, share of that slot's charge before the deadline).
+    let ev_deadline: Option<(i64, f64)> = params.ev.as_ref().and_then(|p| {
+        let mut cands: Vec<f64> = Vec::new();
         if let Some(d) = &p.min_soc_deadline_datetime {
             let seconds = total_seconds(&d.resolve(cfg.timezone), &slot0);
-            cands.push((seconds / slot_seconds + 1e-9).floor() as i64);
+            cands.push(seconds / slot_seconds);
         }
         if let Some(dur) = p.min_soc_max_duration_h {
-            cands.push((dur * 3600.0 / slot_seconds + 1e-9).floor() as i64);
+            // Counted from the start of this run (now), not from its slot start.
+            cands.push(now_position + dur * 3600.0 / slot_seconds);
         }
-        let dl = *cands.iter().min()?;
-        if dl >= ce as i64 {
+        if cands.is_empty() {
             return None;
         }
-        Some(dl.max(0))
+        // A given deadline that has passed does not drop a later one.
+        let upcoming: Vec<f64> = cands.iter().copied().filter(|c| *c >= now_position + 1e-9).collect();
+        if !upcoming.is_empty() && upcoming.len() < cands.len() {
+            cands = upcoming;
+        }
+        // Python's min(): the first minimum.
+        let mut position = cands[0];
+        for &c in &cands[1..] {
+            if c < position {
+                position = c;
+            }
+        }
+        if position >= ce as f64 - 1e-9 {
+            // Beyond the horizon: the end-of-horizon requirement already covers it.
+            return None;
+        }
+        if let Some(csp) = ev_charge_start_position {
+            if position <= csp + 1e-9 {
+                // Not after the charge start: required at the end of the horizon instead.
+                return None;
+            }
+        }
+        if position < now_position + 1e-9 {
+            // Passed while the vehicle is still planned for: required at the end of the horizon.
+            return None;
+        }
+        let deadline_slot = (position + 1e-9).floor();
+        let charge_from = py_max(deadline_slot, now_position);
+        let mut share = (position - charge_from) / (deadline_slot + 1.0 - charge_from);
+        if share < 1e-9 {
+            share = 0.0;
+        }
+        Some((deadline_slot as i64, share))
     });
     let full_charge_slot: Option<i64> = params.pv_battery.as_ref().and_then(|b| {
         b.full_charge_soc_percentage?;
@@ -1701,6 +2093,36 @@ pub fn build<'a>(
         }
         None => None,
     };
+    // A run inside a slot can only charge the vehicle for the rest of it (`first_slot_share`).
+    let ev = ev.map(|mut spec| {
+        spec.first_slot_share = current_slot_share;
+        spec
+    });
+    // `GeneticSimulation.simulate`: the inverter for the two parts of a partly passed slot 0
+    // (`_split_ev_slot_energy`), only with a grid import limit and an EV.
+    let ev_split_inverters = match (&inverter, &ev) {
+        (Some(inv), Some(_))
+            if inv.max_grid_import_wh.is_some() && 0.0 < current_slot_share && current_slot_share < 1.0 =>
+        {
+            let scaled = |part: f64| {
+                let mut part_inverter = inv.clone();
+                part_inverter.slot_duration_h = inv.slot_duration_h * part;
+                part_inverter.max_power_wh = inv.max_power_wh * part;
+                part_inverter.max_grid_import_wh = inv.max_grid_import_wh.map(|wh| wh * part);
+                part_inverter
+            };
+            Some((scaled(1.0 - current_slot_share), scaled(current_slot_share)))
+        }
+        _ => None,
+    };
+    // `ev_rates_desc` of `simulate`: the charger's rates with 0.0, highest first.
+    let mut ev_limit_rates_desc: Vec<f64> = Vec::new();
+    if params.ev.is_some() {
+        ev_limit_rates_desc.push(0.0);
+        ev_limit_rates_desc.extend(ev_rates.iter().copied().filter(|r| *r > 0.0));
+        ev_limit_rates_desc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        ev_limit_rates_desc.dedup_by(|a, b| a == b);
+    }
     let prep = Prepared { params, appliances, layout, battery, ev, inverter };
 
     // Simulation series (full length for validation and terminal value)
@@ -1801,6 +2223,8 @@ pub fn build<'a>(
                             0
                         },
                     });
+                    let penalty =
+                        if inv.max_grid_import_wh.is_some() { grid_import_limit_penalty_per_wh(cfg) } else { 0.0 };
                     let (tail, trace) = curves::build_tail_value_curve(
                         bat,
                         inv,
@@ -1813,6 +2237,7 @@ pub fn build<'a>(
                         &bat_rates,
                         &bat_export,
                         optimize_export,
+                        penalty,
                         numeric.interp_fma,
                     )?;
                     tail_trace = Some(trace);
@@ -1887,7 +2312,9 @@ pub fn build<'a>(
         Some(EvPenalty {
             penalty: cfg.genetic.penalty_float("ev_soc_miss").unwrap_or(10.0),
             min_soc: prep.params.ev.as_ref().map(|p| p.min_soc_percentage as f64).unwrap_or(0.0),
-            deadline_slot: ev_deadline,
+            deadline_slot: ev_deadline.map(|(slot, _)| slot),
+            deadline_share: ev_deadline.map_or(0.0, |(_, share)| share),
+            soc_value_steps: ev_value_steps.clone(),
         })
     } else {
         None
@@ -1913,6 +2340,10 @@ pub fn build<'a>(
             decode: DecodeTable::default(),
             ev_rates: if optimize_ev { ev_rates.clone() } else { Vec::new() },
             ev_zero_index: None,
+            ev_limit_rates_desc,
+            ev_split_inverters,
+            ev_first_charge_slot: ev_first,
+            ev_charge_start_slot: ev_first,
             battery: prep.battery.clone(),
             ev: prep.ev.clone(),
             inverter: prep.inverter.clone(),
@@ -1922,6 +2353,7 @@ pub fn build<'a>(
             terminal,
             break_even,
             full_charge,
+            grid_penalty_per_wh: grid_import_limit_penalty_per_wh(cfg),
             ev_penalty,
             ev_extra_min_soc: ev_extra,
             numeric,
@@ -1943,7 +2375,12 @@ pub fn build<'a>(
         bat_possible_charge_values: bat_rates,
         bat_possible_grid_export_values: bat_export,
         ev_possible_charge_values: ev_rates,
-        ev_soc_deadline_slot: ev_deadline,
+        ev_first_charge_slot: ev_first,
+        ev_soc_deadline_slot: ev_deadline.map(|(slot, _)| slot),
+        ev_soc_deadline_share: ev_deadline.map_or(0.0, |(_, share)| share),
+        ev_first_slot_share: current_slot_share,
+        ev_target_soc_percentage: if prep.params.ev.is_some() { ev_target } else { None },
+        ev_soc_value_steps: if prep.params.ev.is_some() { ev_value_steps } else { None },
         layout: StateLayout::default(),
         mutation_probability: 0.0,
         prices,
@@ -2107,6 +2544,39 @@ pub fn run_built(opt: &mut Optimizer<'_>, b: Built, individuals: Option<i64>) ->
         eval_seconds: opt.eval_ns as f64 / 1e9,
         profile_seconds: opt.prof.iter().map(|v| *v as f64 / 1e9).collect(),
     })
+}
+
+/// `_ev_soc_value_headroom(ev_parameters)`: a positive SoC value step above the vehicle's SoC
+/// and target.
+fn ev_soc_value_headroom(p: &crate::params::ElectricVehicleParameters) -> bool {
+    let Some(steps) = p.soc_value_steps.as_deref().filter(|steps| !steps.is_empty()) else {
+        return false;
+    };
+    let floor = p.initial_soc_percentage.max(p.min_soc_percentage) as f64;
+    let top = p.max_soc_percentage as f64;
+    steps.iter().any(|&(soc, amount)| amount > 0.0 && py_min(soc, top) > floor)
+}
+
+/// `_ev_soc_value_per_wh(soc_percentage)`: value of the next Wh stored in the EV [amount/Wh].
+///
+/// The amount of the first step above both the SoC and the target; 0.0 at or above the
+/// maximum SoC or above the last step.
+fn ev_soc_value_per_wh(steps: &[(f64, f64)], soc_percentage: f64, max_soc_percentage: f64, target: Option<f64>) -> f64 {
+    if steps.is_empty() || soc_percentage >= max_soc_percentage {
+        return 0.0;
+    }
+    let target = target.unwrap_or(0.0);
+    steps
+        .iter()
+        .find(|&&(step_soc, _)| step_soc > soc_percentage && step_soc > target)
+        .map(|&(_, amount)| amount / 1000.0)
+        .unwrap_or(0.0)
+}
+
+/// `_grid_import_limit_penalty_euro_per_wh`.
+fn grid_import_limit_penalty_per_wh(cfg: &RunConfig) -> f64 {
+    cfg.genetic.penalty_float("grid_import_limit_excess").unwrap_or(GRID_IMPORT_LIMIT_EXCESS_PENALTY_EURO_PER_KWH)
+        / 1000.0
 }
 
 /// `_ac_break_even_prices`.

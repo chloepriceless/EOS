@@ -162,6 +162,7 @@ pub fn genetic_solution(c: &CoreSolution, tz: Tz) -> GeneticSolution {
         home_appliance_energy_wh: OrderedMap(c.home_appliance_energy_wh.clone()),
         feed_in_tariff: r.tariff.clone(),
         home_appliance_running: OrderedMap(c.home_appliance_running.clone()),
+        peak_shaving_wh_per_hour: r.peak_shaving.clone(),
     };
     let ev_obj = c.ev_obj.as_ref().map(|e| ElectricVehicleResult {
         device_id: e.spec.device_id.clone(),
