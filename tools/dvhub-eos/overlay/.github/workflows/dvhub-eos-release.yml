@@ -1,0 +1,139 @@
+# DVhub-EOS only (added by tools/dvhub-eos/build-integration.sh from the dvhub-eos/tooling branch).
+# Release assets of a DVhub-EOS tag: the akkudoktoreos-native wheels DVhub installs natively and
+# bakes into its Docker images, plus SHA256SUMS. DVhub pins file name and sha256 per architecture
+# in eos-version.env (DVhub: scripts/eos-native-wheels.sh update-pins SHA256SUMS) and refuses any
+# other bytes - so assets of an existing release are never replaced.
+#   1. wheels:    the same targets as native.yml (x86_64, aarch64, armv7; manylinux 2014 and
+#                 musllinux 1.2), built from the tagged tree with --locked
+#   2. certified: the x86_64 and aarch64 wheels are installed into the tagged EOS and must be
+#                 certified for its GENETIC sources and run natively (the DVhub-EOS rule: a
+#                 Python fallback is a defect)
+#   3. release:   GitHub release for the tag with all wheels and SHA256SUMS
+# Triggers: every pushed tag dvhub-eos-* (this file is part of the tagged tree), or by hand for an
+# existing tag whose tree contains this file (input "tag").
+name: DVhub-EOS release wheels
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags: ["dvhub-eos-*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "DVhub-EOS tag (dvhub-eos-<version>-dvhub.<N>)"
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  wheels:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64, manylinux: "2014" }
+          - { runner: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2014" }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
+          - { runner: ubuntu-latest, target: armv7, manylinux: "2014" }
+          - { runner: ubuntu-latest, target: armv7, manylinux: musllinux_1_2 }
+    steps:
+      - name: Tag is a DVhub-EOS tag
+        run: |
+          case "$TAG" in dvhub-eos-*) ;; *) echo "::error::$TAG is not a dvhub-eos-* tag"; exit 1 ;; esac
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: native/akkudoktoreos-native
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.target }}-${{ matrix.manylinux }}
+          path: native/akkudoktoreos-native/dist/*.whl
+
+  certified:
+    needs: wheels
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: ubuntu-latest, wheel: wheel-x86_64-2014 }
+          - { runner: ubuntu-24.04-arm, wheel: wheel-aarch64-2014 }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+      - name: Install uv
+        run: pip install uv
+      - name: Sync environment with uv
+        run: uv sync --locked --extra dev
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.wheel }}
+          path: wheels
+      - name: Install the wheel
+        run: uv pip install --no-deps wheels/*.whl
+      - name: Native certified and used (no fallback)
+        shell: bash  # -eo pipefail: the exit status survives the pipe into tee
+        env:
+          EOS_OPTIMIZATION__GENETIC__BACKEND: native
+        run: |
+          uv run --no-sync python - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import sys
+          import akkudoktoreos_native as kernel
+          from akkudoktoreos.optimization.genetic import native
+          fingerprint = native.source_fingerprint()
+          status = native.native_status()
+          print(f"`{fingerprint}`, akkudoktoreos-native {kernel.__version__}: "
+                f"certified {'yes' if kernel.is_certified(fingerprint) else 'NO'}, available {status.available}")
+          sys.exit(0 if status.available else 1)
+          EOF
+      - name: Native run on the generated scenarios
+        env:
+          EOS_LOGGING__CONSOLE_LEVEL: ERROR
+        run: |
+          mkdir -p "$RUNNER_TEMP/scenarios" && cd "$RUNNER_TEMP/scenarios"
+          uv run --no-sync --project "$GITHUB_WORKSPACE" \
+            python "$GITHUB_WORKSPACE/native/scripts/parity_scenarios.py" \
+            --count 50 --seed 1 --strict --out "$RUNNER_TEMP/scenarios.json"
+
+  release:
+    needs: [wheels, certified]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          ls -1 *.whl | wc -l | grep -qx 6 || { echo "::error::expected 6 wheels"; ls -l; exit 1; }
+          sha256sum *.whl > SHA256SUMS
+          cat SHA256SUMS | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Create the release (never replace pinned assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG exists - its assets are pinned by DVhub and are not replaced"
+            exit 1
+          fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false \
+            --title "$TAG" \
+            --notes "DVhub-EOS $TAG: akkudoktoreos-native wheels (Rust GENETIC kernel, certified for this tag). DVhub pins name and sha256 per architecture in eos-version.env."

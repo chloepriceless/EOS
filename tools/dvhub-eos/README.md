@@ -94,6 +94,31 @@ Slot) loggt `GENETIC native run` ohne Rückfall. Scheitert er, entfernt das Skri
 bricht ab; `--allow-python` behält es (nur Entwicklung/Messung, nie auf einem Release-Tag).
 `EOS_OPTIMIZATION__GENETIC__BACKEND=python` schaltet den Kern ohne neues Image ab. Nichts wird gepusht.
 
+## Release-Assets: Wheels für DVhub
+
+DVhub installiert den Kern nicht aus einem Eigenbau, sondern als gepinntes Wheel: nativ
+(`eos-provision.sh`, passend zur Plattform des EOS-venv) und in seinen Docker-Images
+(`docker/eos-native` im DVhub-Repo). Die Wheels liegen als Release-Assets am Tag
+`dvhub-eos-<version>-dvhub.<N>`, dazu `SHA256SUMS`; DVhub pinnt Dateiname und sha256 je Architektur
+in `eos-version.env` und nimmt keine anderen Bytes.
+
+`overlay/.github/workflows/dvhub-eos-release.yml` erzeugt sie: Jeder gepushte Tag `dvhub-eos-*`
+(die Datei liegt ab dem nächsten Bau im getaggten Baum) baut die sechs Wheels wie `native.yml`
+(x86_64, aarch64, armv7; manylinux 2014 und musllinux 1.2, `--locked`), prüft x86_64 und aarch64
+im getaggten EOS („zertifiziert“ und ein nativer Szenario-Lauf mit `--strict`) und legt das Release
+mit allen Wheels und `SHA256SUMS` an. Ein bestehendes Release wird nie überschrieben. Danach im
+DVhub-Repo:
+
+    gh release download <tag> -R chloepriceless/EOS -p SHA256SUMS -D /tmp/<tag>
+    scripts/eos-native-wheels.sh update-pins /tmp/<tag>/SHA256SUMS     # eos-version.env
+    # EOS_PIN, EOS_NATIVE_URL, docker/.env.example (EOS_TAG, EOS_IMAGE_TAG) nachziehen
+
+Tags, deren Baum den Workflow noch nicht enthält (bis einschließlich
+`dvhub-eos-0.3.0.dev2611110839161148-dvhub.2`), bekommen ihre Wheels von Hand: dieselben Ziele mit
+maturin und zig gebaut (`maturin build --release --locked --zig --target <ziel> --compatibility
+manylinux2014|musllinux_1_2`) und mit `gh release create <tag> *.whl SHA256SUMS --latest=false`
+hochgeladen — genau die Dateien, deren sha256 DVhub gepinnt hat.
+
 ## Nativer Kern: immer ausgeliefert, immer benutzt
 
 DVhub liefert DVhub-EOS immer mit dem Rust-Kern aus und rechnet damit; ein Python-Rückfall in
@@ -178,4 +203,4 @@ noch in der Liste steht, merged meist leer oder mit Konflikt – beides ist das 
 | `stack.txt` | Basis-Pin, Zweige und Herkunft, Reihenfolge = Merge-Reihenfolge |
 | `rr-cache/` | rerere-Auflösungen (`<id>/preimage`, `<id>/postimage`), versioniert |
 | `merge.gitattributes` | generierte Dateien beim Merge nicht zusammenführen |
-| `overlay/` | Dateien, die nur DVhub-EOS hat (CI-Workflows: Suite für `dvhub-eos/main`, Kern-Prüfung für PRs) |
+| `overlay/` | Dateien, die nur DVhub-EOS hat (CI-Workflows: Suite für `dvhub-eos/main`, Kern-Prüfung für PRs, Release-Wheels je Tag) |
