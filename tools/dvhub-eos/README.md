@@ -3,7 +3,7 @@
 DVhub-EOS ist Akkudoktor-EOS `main` plus die Änderungen, die DVhub braucht und die upstream noch
 nicht gemergt sind. Es wird je DVhub-Release frisch gebaut:
 
-    dvhub-eos/main = upstream/main
+    dvhub-eos/main = gepinnte Basis (Zeile '@base' in stack.txt, ein upstream/main-Stand)
                    + Merge je Zeile in stack.txt (Reihenfolge der Datei)
                    + overlay/        (nur DVhub-EOS: CI für dvhub-eos/main)
                    + make gen-docs   (openapi.json, docs/_generated/* neu erzeugt)
@@ -29,13 +29,17 @@ ein eigener Zweig.
 
 Das Skript
 
-1. holt `upstream` und `fork`, liest `stack.txt` (Ref, Herkunft, optional Pin-SHA),
-2. setzt `dvhub-eos/main` im Bau-Worktree auf `upstream/main` und berechnet die upstream-Version
+1. holt `upstream` und `fork`, liest `stack.txt` (Basis-Pin, je Zeile Ref, Herkunft, optional Pin-SHA),
+2. setzt `dvhub-eos/main` im Bau-Worktree auf die gepinnte Basis und berechnet die upstream-Version
    (`scripts/get_version.py` am unveränderten Stand),
 3. merged jeden Eintrag mit `--no-ff` – mit `git rerere` und den Auflösungen aus `rr-cache/`;
    `openapi.json` und `docs/_generated/**` werden dabei nie zusammengeführt (`merge.gitattributes`),
 4. übernimmt `overlay/`, erzeugt die generierten Dateien mit `make gen-docs` neu,
 5. bricht ab, wenn ein Konflikt ungelöst bleibt oder Konfliktmarker im Ergebnis stehen,
+   **oder wenn der Quell-Fingerabdruck der GENETIC-Quellen des Ergebnisses nicht in
+   `native/akkudoktoreos-native/python/akkudoktoreos_native/certified.json` steht** (für die
+   Kern-Version des Stands) – ein solches DVhub-EOS rechnete in Python. `--allow-python` lässt
+   den Bau trotzdem durch, nur für Entwicklungs- und Messbauten und nie zusammen mit `--tag`,
 6. setzt mit `--tag` das annotierte Tag `dvhub-eos-<upstream-version>-dvhub.<N>`; die Tag-Nachricht
    nennt alle Eingänge mit SHA (Basis, Stack, Tooling-Commit).
 
@@ -84,14 +88,68 @@ Baut zuerst das unveränderte Root-`Dockerfile` des Stands (wie upstream), dann 
 das Wheel `akkudoktoreos-native` aus `native/` des Stands (Rust, maturin) und
 `EOS_OPTIMIZATION__GENETIC__BACKEND=native`. EOS nimmt den Rust-Kern nur, wenn der Fingerabdruck der
 GENETIC-Quellen in seinem `certified.json` steht, sonst rechnet es mit Python (eine Warnung im Log).
-`EOS_OPTIMIZATION__GENETIC__BACKEND=python` schaltet ihn ohne neues Image ab. Nichts wird gepusht.
+Darum folgt ein Rauchtest im fertigen Image (`image/native-smoke.py`): Kern zertifiziert, und ein
+kurzer Lauf mit Netzbezugsgrenze und E-Auto (Ladestart, Frist im Slot, Wertstufen, Lauf mitten im
+Slot) loggt `GENETIC native run` ohne Rückfall. Scheitert er, entfernt das Skript das Image und
+bricht ab; `--allow-python` behält es (nur Entwicklung/Messung, nie auf einem Release-Tag).
+`EOS_OPTIMIZATION__GENETIC__BACKEND=python` schaltet den Kern ohne neues Image ab. Nichts wird gepusht.
+
+## Nativer Kern: immer ausgeliefert, immer benutzt
+
+DVhub liefert DVhub-EOS immer mit dem Rust-Kern aus und rechnet damit; ein Python-Rückfall in
+einem ausgelieferten DVhub-EOS ist ein Fehler. Daraus folgen drei Regeln:
+
+1. **Jeder Fork-PR, der GENETIC ändert, enthält Python und Rust.** GENETIC heißt: eine Datei aus
+   `FINGERPRINT_SOURCES`/`FINGERPRINT_DATA` in `src/akkudoktoreos/optimization/genetic/native.py`.
+   Der PR portiert die Änderung nach `native/` und trägt den neuen Fingerabdruck in
+   `certified.json` ein (Verfahren: `native/README.md`, Nachweis per Compare-Lauf über die Suite und
+   `native/scripts/parity_scenarios.py`). Die Fork-CI (`overlay/.github/workflows/dvhub-eos-native.yml`)
+   prüft auf jedem PR gegen `dvhub-eos/main` „nativ zertifiziert ja/nein“ und vergleicht die
+   Szenarien-Sammlung; „nein“ oder eine Abweichung ist ein roter Check.
+2. **Die Basis ist gepinnt** (`@base` in `stack.txt`) und wird nur bewusst angehoben: zusammen mit
+   dem Kern-Port aller GENETIC-Änderungen zwischen alter und neuer Basis.
+3. **upstream-Änderungen anderer** an diesen Dateien meldet `upstream-watch.sh` als Ledger-Tickets
+   („Kern nachziehen: upstream <PR/commit> <Titel>“). Sie werden portiert, bevor die Basis
+   angehoben wird. Ein gemergter eigener Stack-PR erscheint dort mit dem Hinweis, seine Zeile zu
+   löschen und die Basis anzuheben.
+
+### Basis anheben
+
+    tools/dvhub-eos/upstream-watch.sh --dry-run          # was seit der Basis GENETIC ändert
+    # je Ticket: Kern-Port im Fork-PR (Python ist Referenz), certified.json neu
+    # stack.txt: @base auf den neuen upstream/main-SHA, gemergte upstream#-Zeilen löschen
+    tools/dvhub-eos/build-integration.sh --worktree <bau-worktree>   # bricht ohne Zertifikat ab
+
+### Upstream-Wächter
+
+`upstream-watch.sh` holt `upstream/main`, sucht seit der gepinnten Basis die Commits, die
+fingerabdruck-relevante Dateien ändern (die Liste aus `native.py` von upstream, Basis,
+`dvhub-eos/main` und den Stack-Zweigen, dazu `native.py` und `native/`), und legt je upstream-PR
+(Squash-Merge „(#<nr>)“, sonst je Commit) ein Ledger-Ticket an (`--domain EOS --release 1.0.11
+--labels strang,eos-upstream`). Idempotent: steht ein Ticket mit dem Titelanfang
+„Kern nachziehen: upstream <PR/commit> “ schon im Ledger, entsteht kein zweites. Der Ledger-Sync
+spiegelt die Tickets als Issues. `--dry-run` zeigt nur an.
+
+Täglicher Lauf per **launchd auf dem Mac** (`launchd/net.dvhub.eos-upstream-watch.plist`, 06:30,
+verpasste Läufe nach dem Aufwachen), nicht als geplanter Workflow im Fork: Das Ledger
+(`ledger.py`, `tickets.json`) liegt nur auf dem Mac, und nur von dort spiegelt der Sync die
+Tickets als Issues. Ein Workflow im Fork müsste Issues direkt anlegen (Token als Secret, am Ledger
+vorbei) und bräuchte einen zweiten Weg zurück ins Ledger; der Abruf von upstream ist dagegen
+öffentliches GitHub und braucht kein Heimnetz. Installation (einmalig):
+
+    cp tools/dvhub-eos/launchd/net.dvhub.eos-upstream-watch.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.dvhub.eos-upstream-watch.plist
 
 ## Fork-PR-Ablauf (eigene Änderungen)
 
 1. Feature-Zweig auf **`upstream/main`** (nicht auf `dvhub-eos/main`) – dann bleibt er unverändert
-   upstream einreichbar.
+   upstream einreichbar. Ausnahme: ein Zweig, der offene Stack-PRs voraussetzt (z. B. der
+   Kern-Port `feat/t0420-native-parity-ev-grid` für #1531/#1532), setzt auf `dvhub-eos/main` auf
+   und geht upstream erst als Folge-PR, wenn seine Voraussetzungen dort gemergt sind.
 2. PR im Fork `chloepriceless/EOS` gegen `dvhub-eos/main`. Die upstream-Workflows (pytest,
-   pre-commit, docker-build, native) laufen auf jedem PR, also auch auf diesem.
+   pre-commit, docker-build, native) und `dvhub-eos-native.yml` laufen auf jedem PR, also auch auf
+   diesem. Ändert der PR GENETIC, enthält er Python **und** den Kern-Port samt `certified.json`
+   (siehe „Nativer Kern“).
 3. Nach dem Merge des Fork-PR: Zeile `fork/<zweig>  fork#<nr>` in `stack.txt`, commit auf
    `dvhub-eos/tooling`, neu bauen. (Der Merge-Commit des Fork-PR geht beim nächsten Neubau verloren;
    maßgeblich ist `stack.txt`.)
@@ -113,9 +171,11 @@ noch in der Liste steht, merged meist leer oder mit Konflikt – beides ist das 
 
 | Datei | Zweck |
 |---|---|
-| `build-integration.sh` | baut `dvhub-eos/main`, optional Tag |
+| `build-integration.sh` | baut `dvhub-eos/main`, prüft das Kern-Zertifikat, optional Tag |
 | `build-image.sh`, `image/Dockerfile.native` | baut das Docker-Image lokal |
-| `stack.txt` | Zweige und Herkunft, Reihenfolge = Merge-Reihenfolge |
+| `image/native-smoke.py` | Rauchtest im Image: Kern zertifiziert, Lauf nativ ohne Rückfall |
+| `upstream-watch.sh`, `launchd/` | meldet fingerabdruck-relevante upstream-Änderungen als Ledger-Tickets |
+| `stack.txt` | Basis-Pin, Zweige und Herkunft, Reihenfolge = Merge-Reihenfolge |
 | `rr-cache/` | rerere-Auflösungen (`<id>/preimage`, `<id>/postimage`), versioniert |
 | `merge.gitattributes` | generierte Dateien beim Merge nicht zusammenführen |
-| `overlay/` | Dateien, die nur DVhub-EOS hat (CI-Workflow für `dvhub-eos/main`) |
+| `overlay/` | Dateien, die nur DVhub-EOS hat (CI-Workflows: Suite für `dvhub-eos/main`, Kern-Prüfung für PRs) |

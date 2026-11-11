@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  DVhub-EOS: täglicher Lauf von tools/dvhub-eos/upstream-watch.sh (06:30, verpasste Läufe nach dem
+  Aufwachen). Installation (einmalig, nicht automatisch):
+    cp tools/dvhub-eos/launchd/net.dvhub.eos-upstream-watch.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.dvhub.eos-upstream-watch.plist
+  Log: ~/Library/Logs/eos-upstream-watch.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.dvhub.eos-upstream-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>cd "$HOME/Projects/eos-dvhub-tooling" &amp;&amp; tools/dvhub-eos/upstream-watch.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/christin/Library/Logs/eos-upstream-watch.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/christin/Library/Logs/eos-upstream-watch.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

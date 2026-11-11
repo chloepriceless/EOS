@@ -9,8 +9,16 @@
 #                 wird; muss in der Zweighistorie liegen
 # Alles nach '#' ist Kommentar. Ein Eintrag fällt heraus, sobald upstream ihn gemergt hat
 # (dann steckt er schon in upstream/main) – siehe README.md.
+#
+# Basis: '@base <remote>/<zweig> <sha>' pinnt den upstream-Stand, auf dem gebaut wird (Pflicht).
+# Sie wird nur bewusst angehoben – zusammen mit dem Kern-Port aller GENETIC-Änderungen zwischen
+# alter und neuer Basis (upstream-watch.sh meldet sie). Der Bau prüft, dass der Quell-Fingerabdruck
+# des Ergebnisses in native/.../certified.json steht.
+
+@base                                      upstream/main   62cbf4cf2a71154c7389dcd5be00314f5b3c8a8c
 
 fork/pr/genetic-deterministic-dot          upstream#1518   # np.dot in fester Reihenfolge (bitgleiche Pläne je CPU)
 fork/pr/native-genetic-switch              upstream#1520   # optionaler Rust-Kern für GENETIC (+ Schalter)
 fork/feat/grid-peak-shaving-threshold      upstream#1531   # Netzbezugsgrenze + Peak-Shaving-Schwelle
 fork/feat/ev-soc-value                     upstream#1532   # E-Auto: Ladestart, Seeding, Wert über Ziel-SoC
+fork/feat/t0420-native-parity-ev-grid      fork#1          # nativer Kern paritätisch zu #1531/#1532 (T-0420)

@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
 # build-integration.sh – baut den Zweig dvhub-eos/main neu:
-#   upstream/main + alle Zweige aus stack.txt (in dieser Reihenfolge, je ein --no-ff-Merge)
+#   gepinnte Basis ('@base' in stack.txt, ein upstream/main-Stand)
+#   + alle Zweige aus stack.txt (in dieser Reihenfolge, je ein --no-ff-Merge)
 #   + overlay/ (DVhub-eigene Zusatzdateien, z. B. CI für dvhub-eos/main)
 #   + neu erzeugte openapi.json und docs/_generated/* (make gen-docs)
 # und setzt auf Wunsch das Tag dvhub-eos-<upstream-version>-dvhub.<N>.
+#
+# Nativer Kern: Der Bau schlägt fehl, wenn der Quell-Fingerabdruck der GENETIC-Quellen des
+# Ergebnisses nicht in native/akkudoktoreos-native/python/akkudoktoreos_native/certified.json
+# (für die Kern-Version des Stands) steht – ein solches DVhub-EOS rechnete in Python.
+# --allow-python lässt den Bau trotzdem durch (nur Entwicklungs- und Messbauten), nie mit --tag.
 #
 # Konflikte: git rerere mit den versionierten Auflösungen aus rr-cache/ (dieses Verzeichnis).
 # Generierte Dateien werden nie zusammengeführt (merge.gitattributes), sondern am Ende neu erzeugt.
 # Bleibt ein Konflikt ungelöst, bricht das Skript ab und lässt den Merge im Bau-Worktree stehen.
 #
 # Aufruf (aus einem Checkout des Zweigs dvhub-eos/tooling):
-#   tools/dvhub-eos/build-integration.sh [--worktree DIR] [--tag] [--no-fetch]
+#   tools/dvhub-eos/build-integration.sh [--worktree DIR] [--tag] [--no-fetch] [--allow-python]
 #   tools/dvhub-eos/build-integration.sh --record [--worktree DIR]
 #       nach einer Handauflösung: Auflösung für rerere festhalten und nach rr-cache/ übernehmen
 #
 # Umgebung: DVHUB_EOS_WORKTREE (Bau-Worktree, Vorgabe <repo>/../eos-dvhub-build),
-#           UPSTREAM_REMOTE (upstream), FORK_REMOTE (fork), BASE_REF (<UPSTREAM_REMOTE>/main),
+#           UPSTREAM_REMOTE (upstream), FORK_REMOTE (fork),
 #           TARGET_BRANCH (dvhub-eos/main), PYTHON (python3, >= 3.11), UV_CACHE_DIR (an uv durchgereicht).
 # Commit-Identität: wie in git konfiguriert oder per GIT_AUTHOR_*/GIT_COMMITTER_*.
 set -euo pipefail
@@ -28,12 +34,11 @@ ATTR="$TOOLS/merge.gitattributes"
 
 UPSTREAM_REMOTE=${UPSTREAM_REMOTE:-upstream}
 FORK_REMOTE=${FORK_REMOTE:-fork}
-BASE_REF=${BASE_REF:-$UPSTREAM_REMOTE/main}
 TARGET_BRANCH=${TARGET_BRANCH:-dvhub-eos/main}
 PYTHON=${PYTHON:-python3}
 TAG_PREFIX=dvhub-eos-
 
-DO_FETCH=1 DO_TAG=0 DO_RECORD=0
+DO_FETCH=1 DO_TAG=0 DO_RECORD=0 ALLOW_PYTHON=0
 WT=${DVHUB_EOS_WORKTREE:-}
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,7 +46,8 @@ while [ $# -gt 0 ]; do
     --tag) DO_TAG=1; shift ;;
     --no-fetch) DO_FETCH=0; shift ;;
     --record) DO_RECORD=1; shift ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --allow-python) ALLOW_PYTHON=1; shift ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unbekannte Option: $1" >&2; exit 64 ;;
   esac
 done
@@ -54,6 +60,8 @@ die() { echo "ABBRUCH: $*" >&2; exit 1; }
 say() { echo "== $*"; }
 
 case "$WT" in ""|/*) ;; *) WT="$PWD/$WT" ;; esac   # relativ zum Aufrufer, nicht zum Repo
+[ "$ALLOW_PYTHON" = 0 ] || [ "$DO_TAG" = 0 ] || die "--allow-python nie mit --tag: ein Release rechnet immer nativ"
+
 
 COMMON=$(cd "$TOOLS" && git rev-parse --path-format=absolute --git-common-dir)
 REPO_TOP=$(dirname "$COMMON")
@@ -120,10 +128,9 @@ if [ "$DO_FETCH" = 1 ]; then
   # Holen fehlen sie und das Skript vergäbe ein schon veröffentlichtes dvhub.<N> erneut.
   git -C "$REPO_TOP" fetch --quiet --no-prune "$FORK_REMOTE" "refs/tags/$TAG_PREFIX*:refs/tags/$TAG_PREFIX*"
 fi
-BASE_SHA=$(git -C "$REPO_TOP" rev-parse --verify "$BASE_REF^{commit}")
-
-# stack.txt lesen: Ref, Herkunft, optional Pin
+# stack.txt lesen: '@base <ref> <sha>' (Pflicht) und je Zeile Ref, Herkunft, optional Pin
 REFS=() ORIGINS=() SHAS=()
+BASE_REF= BASE_PIN=
 set -f
 while IFS= read -r line || [ -n "$line" ]; do
   # Kommentar = '#' am Zeilenanfang oder nach Leerraum ('upstream#1518' bleibt ganz)
@@ -131,6 +138,12 @@ while IFS= read -r line || [ -n "$line" ]; do
   # shellcheck disable=SC2086
   set -- $line
   [ $# -eq 0 ] && continue
+  if [ "$1" = "@base" ]; then
+    [ -z "$BASE_REF" ] || die "stack.txt: mehr als eine Zeile @base"
+    BASE_REF=${2:-} BASE_PIN=${3:-}
+    [ -n "$BASE_REF" ] && [ -n "$BASE_PIN" ] || die "stack.txt: @base braucht Ref und SHA ('@base upstream/main <sha>')"
+    continue
+  fi
   ref=$1 origin=${2:-} pin=${3:-}
   case "$origin" in
     upstream\#[0-9]*|fork\#[0-9]*) ;;
@@ -146,6 +159,12 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$STACK"
 set +f
 [ ${#REFS[@]} -gt 0 ] || die "stack.txt ist leer"
+[ -n "$BASE_REF" ] || die "stack.txt: Zeile '@base <ref> <sha>' fehlt (gepinnte upstream-Basis)"
+BASE_SHA=$(git -C "$REPO_TOP" rev-parse --verify --quiet "$BASE_PIN^{commit}") || die "stack.txt: Basis $BASE_PIN unbekannt"
+BASE_TIP=$(git -C "$REPO_TOP" rev-parse --verify --quiet "$BASE_REF^{commit}") || die "stack.txt: $BASE_REF unbekannt"
+git -C "$REPO_TOP" merge-base --is-ancestor "$BASE_SHA" "$BASE_TIP" || die "stack.txt: Basis $BASE_PIN liegt nicht in $BASE_REF"
+AHEAD=$(git -C "$REPO_TOP" rev-list --count "$BASE_SHA..$BASE_TIP")
+[ "$AHEAD" = 0 ] || say "$BASE_REF ist $AHEAD Commits weiter als die Basis – Anheben nur mit Kern-Port (tools/dvhub-eos/upstream-watch.sh)"
 
 # Bau-Worktree: frisch anlegen oder sauber vorfinden
 if [ ! -e "$WT/.git" ]; then
@@ -231,6 +250,31 @@ fi
 
 HEAD_SHA=$(git -C "$WT" rev-parse HEAD)
 say "$TARGET_BRANCH = ${HEAD_SHA:0:9}"
+
+# ---------- nativer Kern zertifiziert? ----------
+say "prüfe den Quell-Fingerabdruck gegen certified.json"
+CERT_LOG="$COMMON/dvhub-eos-certified.log"
+if (cd "$WT" && uv run --python "$PYTHON" python - >"$CERT_LOG" 2>&1) <<'PYEOF'
+import json, sys, tomllib
+from pathlib import Path
+from akkudoktoreos.optimization.genetic.native import compute_fingerprint
+
+fingerprint = compute_fingerprint(Path("src/akkudoktoreos").resolve())
+package = Path("native/akkudoktoreos-native")
+version = tomllib.loads((package / "pyproject.toml").read_text())["project"]["version"]
+entries = json.loads((package / "python/akkudoktoreos_native/certified.json").read_text())["entries"]
+certified = any(e["fingerprint"] == fingerprint and e["kernel_version"] == version for e in entries)
+print(f"{'certified' if certified else 'NOT certified'}: {fingerprint} kernel {version}")
+sys.exit(0 if certified else 1)
+PYEOF
+then
+  say "nativer Kern zertifiziert: $(tail -1 "$CERT_LOG")"
+elif [ "$ALLOW_PYTHON" = 1 ]; then
+  say "WARNUNG: $(tail -1 "$CERT_LOG") – dieser Bau rechnet in Python (--allow-python, nur Entwicklung/Messung)"
+else
+  cat "$CERT_LOG" >&2
+  die "Quell-Fingerabdruck nicht zertifiziert – DVhub-EOS rechnete in Python. Kern portieren und zertifizieren (native/README.md), oder für Entwicklungs-/Messbauten --allow-python"
+fi
 
 # ---------- Tag ----------
 if [ "$DO_TAG" = 1 ]; then
