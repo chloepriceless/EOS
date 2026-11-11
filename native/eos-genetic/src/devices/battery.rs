@@ -33,6 +33,9 @@ pub struct BatterySpec {
     pub min_soc_wh: f64,
     pub max_soc_wh: f64,
     pub slot_duration_h: f64,
+    /// `first_slot_share`: part of slot 0 still ahead of the run; scales the charge power cap of
+    /// slot 0 only (the EV; 1.0 for the home battery).
+    pub first_slot_share: f64,
 }
 
 fn unique_sorted(rates: &[f64]) -> Vec<f64> {
@@ -84,6 +87,7 @@ impl BatterySpec {
             min_soc_wh: (min_soc_percentage / 100.0) * capacity,
             max_soc_wh: (max_soc_percentage / 100.0) * capacity,
             slot_duration_h,
+            first_slot_share: 1.0,
         }
     }
 
@@ -191,6 +195,23 @@ impl Battery {
         py_min(raw_power_remaining_wh, raw_soc_available_wh) * self.s.discharging_efficiency
     }
 
+    #[inline]
+    pub fn remaining_charge_budget_wh(&self, hour: usize) -> f64 {
+        py_max(py_min(self.s.max_charge_power_w * self.s.slot_duration_h, self.limit[hour]) - self.charged[hour], 0.0)
+    }
+
+    /// `slot_state(hour)`: SoC and the raw energy discharged and charged so far in the slot.
+    #[inline]
+    pub fn slot_state(&self, hour: usize) -> (f64, f64, f64) {
+        (self.soc_wh, self.discharged[hour], self.charged[hour])
+    }
+
+    /// `restore_slot_state(hour, state)`.
+    #[inline]
+    pub fn restore_slot_state(&mut self, hour: usize, state: (f64, f64, f64)) {
+        (self.soc_wh, self.discharged[hour], self.charged[hour]) = state;
+    }
+
     /// `discharged_energy_wh(hour)`.
     #[inline]
     pub fn discharged_energy_wh(&self, hour: usize) -> f64 {
@@ -210,10 +231,13 @@ impl Battery {
             return Ok((0.0, 0.0));
         }
         let soc = self.soc_wh;
-        let max_per_slot = py_max(
-            py_min(self.s.max_charge_power_w * self.s.slot_duration_h, self.limit[hour]) - self.charged[hour],
-            0.0,
-        );
+        // Slot 0 only has the part of it left that is still ahead of the run.
+        let mut slot_duration_h = self.s.slot_duration_h;
+        if hour == 0 {
+            slot_duration_h *= self.s.first_slot_share;
+        }
+        let max_per_slot =
+            py_max(py_min(self.s.max_charge_power_w * slot_duration_h, self.limit[hour]) - self.charged[hour], 0.0);
         let eff = self.s.charging_efficiency;
         let mut raw_request;
         let raw_charge;

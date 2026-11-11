@@ -3,7 +3,7 @@
 //! (`build_tail_value_curve`, `_simulate_action`, `TailValueCurve.diagnostic_plan`).
 
 use crate::devices::battery::{Battery, BatterySpec, SimError};
-use crate::devices::inverter::Inverter;
+use crate::devices::inverter::{GRID_IMPORT_LIMIT_TOLERANCE_WH, Inverter};
 use crate::numpy::{self, py_max, py_min};
 use crate::selfconsumption::SelfConsumption;
 
@@ -183,6 +183,7 @@ pub fn simulate_action(
     pv: f64,
     tariff: f64,
     direct_marketing: bool,
+    grid_import_penalty_euro_per_wh: f64,
     integer_charge_array: bool,
 ) -> Result<ActionResult, SimError> {
     // `integer_charge_array`: the battery of `TailValueCurve.diagnostic_plan` keeps the integer
@@ -202,12 +203,12 @@ pub fn simulate_action(
         inv.begin_ac_charge_slot(Some(bat), 0, rate);
     }
     let allow = direct_marketing && export > 0.0 && tariff > 0.0;
-    let (mut sold, mut bought, mut losses, _) = inv.process_energy(Some(bat), sc, pv, load, 0, allow, export)?;
+    let (mut sold, mut bought, mut losses, _, _) = inv.process_energy(Some(bat), sc, pv, load, 0, allow, export)?;
     let mut ac_grid_charge_wh = 0.0;
     if ac_rate > 0.0 && inv.ac_to_dc_efficiency > 0.0 {
         bat.charge_array[0] = store(rate);
         if rate > 0.0 {
-            let (a, l) = inv.charge_battery_from_grid(bat, 0, rate)?;
+            let (a, l, _) = inv.charge_battery_from_grid_executed(bat, 0, rate, Some(bought))?;
             ac_grid_charge_wh = a;
             bought += a;
             losses += l;
@@ -217,7 +218,12 @@ pub fn simulate_action(
         sold = 0.0;
     }
     let discharged_wh = bat.discharged_energy_wh(0);
-    let reward = sold * tariff - bought * price - (discharged_wh * bat.s.levelized_cost_of_storage_kwh / 1000.0);
+    let mut reward = sold * tariff - bought * price - (discharged_wh * bat.s.levelized_cost_of_storage_kwh / 1000.0);
+    if let Some(lim) = inv.max_grid_import_wh {
+        if bought > lim + GRID_IMPORT_LIMIT_TOLERANCE_WH {
+            reward -= (bought - lim) * grid_import_penalty_euro_per_wh;
+        }
+    }
     Ok(ActionResult {
         next_state_wh: bat.soc_wh,
         reward_euro: reward,
@@ -241,6 +247,7 @@ pub struct TailTrace {
     pub pv: Vec<f64>,
     pub tariffs: Vec<f64>,
     pub direct_marketing: bool,
+    pub grid_import_penalty_euro_per_wh: f64,
 }
 
 /// One row of `diagnostic_plan` (`TailPlanSlot`).
@@ -283,6 +290,7 @@ pub fn build_tail_value_curve(
     charge_rates: &[f64],
     export_rates: &[f64],
     direct_marketing: bool,
+    grid_import_penalty_euro_per_wh: f64,
     fma: bool,
 ) -> Result<(ValueCurve, TailTrace), String> {
     let n = prices.len();
@@ -325,9 +333,21 @@ pub fn build_tail_value_curve(
         let mut best_continuation = vec![0.0f64; ns];
         for action in &actions {
             for (i, &energy) in states.iter().enumerate() {
-                let r =
-                    simulate_action(&mut bat, &inv, sc, energy, action, price, ld, p, tariff, direct_marketing, false)
-                        .map_err(|_| "battery capacity exceeded in the tail".to_string())?;
+                let r = simulate_action(
+                    &mut bat,
+                    &inv,
+                    sc,
+                    energy,
+                    action,
+                    price,
+                    ld,
+                    p,
+                    tariff,
+                    direct_marketing,
+                    grid_import_penalty_euro_per_wh,
+                    false,
+                )
+                .map_err(|_| "battery capacity exceeded in the tail".to_string())?;
                 rewards[i] = r.reward_euro;
                 next_states[i] = r.next_state_wh;
             }
@@ -374,6 +394,7 @@ pub fn build_tail_value_curve(
         pv: pv.to_vec(),
         tariffs: feed_in.to_vec(),
         direct_marketing,
+        grid_import_penalty_euro_per_wh,
     };
     Ok((curve, trace))
 }
@@ -414,6 +435,7 @@ pub fn diagnostic_plan(
                 pv,
                 tariff,
                 trace.direct_marketing,
+                trace.grid_import_penalty_euro_per_wh,
                 true,
             )?;
             let remaining = numpy::interp(r.next_state_wh, &trace.states, &trace.future_values[slot + 1], fma);

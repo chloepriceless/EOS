@@ -1,7 +1,7 @@
 [package]
 name = "akkudoktoreos-native"
 description = "Python binding of the native Akkudoktor-EOS kernels"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
