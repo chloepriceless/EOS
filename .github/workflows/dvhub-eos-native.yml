@@ -1,0 +1,86 @@
+# DVhub-EOS only (added by tools/dvhub-eos/build-integration.sh from the dvhub-eos/tooling branch).
+# DVhub always ships and uses the native GENETIC kernel; a DVhub-EOS that falls back to Python is
+# a defect. On every pull request against dvhub-eos/main and on every rebuild of dvhub-eos/main:
+#   1. "native certified": the fingerprint of the GENETIC sources is in certified.json of the
+#      kernel built from native/ - otherwise this check is red (port the change to native/ and
+#      certify it, see native/README.md);
+#   2. compare: the generated scenarios (native/scripts/parity_scenarios.py --strict) run in
+#      Python and in the kernel; a difference, a kernel failure or a scenario the kernel rejects
+#      (it would run in Python) is red.
+# The upstream workflow native.yml additionally compares every GENETIC run of the test suite.
+name: DVhub-EOS native kernel
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: ["dvhub-eos/main"]
+  push:
+    branches: ["dvhub-eos/main"]
+  workflow_dispatch:
+
+jobs:
+  native:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+          - { runner: ubuntu-latest, arch: x86_64 }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv and maturin
+        run: pip install uv "maturin==1.16.0"
+
+      - name: Sync environment with uv
+        run: uv sync --locked --extra dev
+
+      - name: Build and install the native kernel
+        working-directory: native/akkudoktoreos-native
+        run: |
+          maturin build --release --locked --out dist
+          uv pip install --python ../../.venv/bin/python dist/*.whl
+
+      - name: Native certified (yes/no)
+        shell: bash  # -eo pipefail: the exit status survives the pipe into tee
+        run: |
+          uv run --no-sync python - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import sys
+          import akkudoktoreos_native as kernel
+          from akkudoktoreos.optimization.genetic import native
+          fingerprint = native.source_fingerprint()
+          status = native.native_status()
+          certified = kernel.is_certified(fingerprint)
+          print(f"GENETIC sources `{fingerprint}`, akkudoktoreos-native {kernel.__version__}: "
+                f"native certified: {'yes' if certified else 'NO'}")
+          if not certified or not status.available:
+              print(f"\nDVhub-EOS would fall back to Python ({status.reason}). Port the GENETIC "
+                    "change to native/ and certify it (native/README.md).")
+              sys.exit(1)
+          EOF
+
+      - name: Compare the generated scenarios
+        env:
+          EOS_LOGGING__CONSOLE_LEVEL: ERROR
+        run: |
+          mkdir -p "$RUNNER_TEMP/scenarios" && cd "$RUNNER_TEMP/scenarios"
+          uv run --no-sync --project "$GITHUB_WORKSPACE" \
+            python "$GITHUB_WORKSPACE/native/scripts/parity_scenarios.py" \
+            --count 200 --seed 1 --strict --out "$GITHUB_WORKSPACE/scenarios.json"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: scenarios-${{ matrix.arch }}
+          path: scenarios.json
