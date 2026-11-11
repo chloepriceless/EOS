@@ -53,6 +53,8 @@ export CODEX_REVIEW_SKIP=1
 die() { echo "ABBRUCH: $*" >&2; exit 1; }
 say() { echo "== $*"; }
 
+case "$WT" in ""|/*) ;; *) WT="$PWD/$WT" ;; esac   # relativ zum Aufrufer, nicht zum Repo
+
 COMMON=$(cd "$TOOLS" && git rev-parse --path-format=absolute --git-common-dir)
 REPO_TOP=$(dirname "$COMMON")
 WT=${WT:-$(dirname "$REPO_TOP")/eos-dvhub-build}
@@ -67,7 +69,8 @@ g() {
     -c merge.dvhub-eos-generated.driver=true "$@"
 }
 
-# Versionierte Auflösungen <-> .git/rr-cache. Nur vollständige Auflösungen (mit postimage).
+# Versionierte Auflösungen <-> .git/rr-cache. rr-cache/ ist maßgeblich: rr_import überschreibt den
+# gemeinsamen Cache bei jedem Bau; zurück nach rr-cache/ geht es nur mit --record.
 rr_import() {
   [ -d "$RR_DIR" ] || return 0
   for d in "$RR_DIR"/*/; do
@@ -113,6 +116,9 @@ if [ "$DO_FETCH" = 1 ]; then
   say "hole $UPSTREAM_REMOTE und $FORK_REMOTE"
   git -C "$REPO_TOP" fetch --quiet "$UPSTREAM_REMOTE"
   git -C "$REPO_TOP" fetch --quiet "$FORK_REMOTE"
+  # Release-Tags zeigen nach einem Neubau auf Commits außerhalb jedes Zweigs; ohne ausdrückliches
+  # Holen fehlen sie und das Skript vergäbe ein schon veröffentlichtes dvhub.<N> erneut.
+  git -C "$REPO_TOP" fetch --quiet "$FORK_REMOTE" "refs/tags/$TAG_PREFIX*:refs/tags/$TAG_PREFIX*"
 fi
 BASE_SHA=$(git -C "$REPO_TOP" rev-parse --verify "$BASE_REF^{commit}")
 
@@ -149,7 +155,6 @@ fi
 [ -z "$(git -C "$WT" status --porcelain --untracked-files=no)" ] || die "Bau-Worktree $WT hat Änderungen oder einen offenen Merge"
 if git -C "$WT" rev-parse -q --verify MERGE_HEAD >/dev/null; then die "offener Merge in $WT"; fi
 
-rr_export   # Auflösungen eines vorherigen, von Hand beendeten Laufs sichern
 rr_import
 
 # Reproduzierbar: alle Commits des Laufs tragen den jüngsten Commit-Zeitpunkt der Eingänge. Gleiche
@@ -217,14 +222,12 @@ fi
 # ---------- generierte Dateien ----------
 say "make gen-docs"
 GEN_LOG="$COMMON/dvhub-eos-gen-docs.log"
-(cd "$WT" && make gen-docs >"$GEN_LOG" 2>&1) || die "make gen-docs gescheitert, siehe $GEN_LOG"
+(cd "$WT" && make gen-docs UV_PYTHON="$PYTHON" >"$GEN_LOG" 2>&1) || die "make gen-docs gescheitert, siehe $GEN_LOG"
 git -C "$WT" add -A openapi.json docs/_generated
 if ! git -C "$WT" diff --cached --quiet; then
   git -C "$WT" commit --quiet -m "chore(dvhub-eos): regenerate openapi.json and docs/_generated"
 fi
 [ -z "$(git -C "$WT" status --porcelain --untracked-files=no)" ] || die "make gen-docs hat weitere Dateien geändert: $(git -C "$WT" status --porcelain --untracked-files=no)"
-
-rr_export
 
 HEAD_SHA=$(git -C "$WT" rev-parse HEAD)
 say "$TARGET_BRANCH = ${HEAD_SHA:0:9}"
