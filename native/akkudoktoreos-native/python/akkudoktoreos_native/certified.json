@@ -2,11 +2,11 @@
   "format": 1,
   "entries": [
     {
-      "fingerprint": "sha256:bdccf74d41868eee6c3c9d3351207197fbdffd532af5b219efc03129742fa256",
-      "kernel_version": "0.1.0",
-      "verified": "2026-11-10",
-      "evidence": "60 identical runs, 19 not supported natively, 14 with patched Python, 0 different (dot: sequential)",
-      "note": "Akkudoktor-EOS main 7767028 + native GENETIC backend switch; GENETIC test suite in compare mode on linux/aarch64 with the sequential dot product"
+      "fingerprint": "sha256:35471d68ed2874704ce98c224fc0ae58a30e688741575db8646d0198baf73740",
+      "kernel_version": "0.2.0",
+      "verified": "2026-11-11",
+      "evidence": "297 identical runs, 19 not supported natively, 13 with patched Python, 0 different (dot: sequential)",
+      "note": "DVhub-EOS dvhub-eos/main dbfdd49 (Akkudoktor-EOS main 62cbf4c + #1518 + #1520 + #1531 + #1532); GENETIC test suite in compare mode on linux/aarch64; plus 400 of 400 generated scenarios identical (native/scripts/parity_scenarios.py --count 400 --seed 1)"
     }
   ]
 }
