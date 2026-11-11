@@ -80,7 +80,8 @@ pub fn build_terminal_value_curve(
         .collect();
     let lcos_per_wh_ac = (lcos_euro_per_kwh / 1000.0) / py_max(dc_to_ac_efficiency, 1e-9);
     let neg: Vec<f64> = prices[..window].iter().map(|p| -p).collect();
-    let order = numpy::argsort_quicksort(&neg);
+    // `np.argsort(-prices, kind="stable")`.
+    let order = numpy::argsort_stable(&neg);
     let mut energy_points = vec![0.0f64];
     let mut value_points = vec![0.0f64];
     let mut marginals: Vec<f64> = Vec::new();

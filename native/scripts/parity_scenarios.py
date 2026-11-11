@@ -178,9 +178,17 @@ def scenario(seed: int) -> dict[str, Any]:
             ev["soc_value_steps"] = steps
         data["ev"] = ev
     if rng.random() < 0.25:
-        data["home_appliances"] = [
-            {"device_id": "dishwasher1", "consumption_wh": 1800, "duration_h": 2},
-        ]
+        appliance: dict[str, Any] = {
+            "device_id": "dishwasher1", "consumption_wh": 1800, "duration_h": 2,
+        }
+        # As DVhub sends deferrable devices: an earliest start and a deadline ("done by").
+        if rng.random() < 0.6:
+            earliest = start + dt.timedelta(minutes=rng.randrange(0, 240))
+            appliance["earliest_start_datetime"] = _iso(earliest)
+            appliance["deadline_datetime"] = _iso(
+                earliest + dt.timedelta(hours=rng.choice((3, 6, 10)))
+            )
+        data["home_appliances"] = [appliance]
 
     settings = {
         "interval_sec": interval,

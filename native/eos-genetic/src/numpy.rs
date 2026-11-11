@@ -496,12 +496,35 @@ mod tests {
             assert_eq!(k.dot(&a, &b), 4950.0);
         }
     }
+
+    #[test]
+    fn argsort_stable_keeps_equal_values_in_index_order() {
+        let v = [2.0, 1.0, f64::NAN, 1.0, 2.0, -0.0, 0.0];
+        assert_eq!(argsort_stable(&v), vec![5, 6, 1, 3, 0, 4, 2]);
+    }
 }
 
 /// NumPy's `Tag::less` for float64: NaN sorts last.
 #[inline(always)]
 fn np_less(a: f64, b: f64) -> bool {
     a < b || (b.is_nan() && !a.is_nan())
+}
+
+/// `np.argsort(v, kind="stable")`: ascending, NaN last, equal values in index order (the same on
+/// every platform, unlike the default kind).
+pub fn argsort_stable(v: &[f64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..v.len()).collect();
+    // `sort_by` is stable; NumPy's order: NaN after every number.
+    order.sort_by(|&a, &b| {
+        if np_less(v[a], v[b]) {
+            std::cmp::Ordering::Less
+        } else if np_less(v[b], v[a]) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    order
 }
 
 /// `np.argsort(v)` with the default kind "quicksort" (NumPy `aquicksort_`: introsort with
