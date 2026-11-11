@@ -12,7 +12,8 @@ with the same seed, solutions compared bit for bit.
 
 The report has the layout of ``genetic_compare_plugin`` (``summary`` with ``identical``,
 ``different``, ``failed``, fingerprint and kernel version), so ``certify.py`` reads it too.
-Exit status 1 if any scenario differs or fails natively.
+Exit status 1 if any scenario differs or fails natively; with ``--strict`` also if the kernel
+rejects a scenario (``unsupported``: that run would fall back to Python) or none is identical.
 """
 
 from __future__ import annotations
@@ -301,6 +302,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1, help="seed of the first scenario")
     parser.add_argument("--out", default="")
     parser.add_argument("--only", type=int, nargs="*", help="run only these scenario seeds")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="also fail when the kernel rejects a scenario or no scenario is identical",
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("EOS_CONFIG_DIR", os.path.join(os.getcwd(), ".parity-config"))
@@ -376,7 +382,12 @@ def main() -> int:
         f"{summary['python_error']} Python errors; Python {python_s:.1f} s, native {native_s:.1f} s "
         "(identical runs)"
     )
-    return 1 if summary["different"] or summary["failed"] else 0
+    if summary["different"] or summary["failed"]:
+        return 1
+    if args.strict and (summary["unsupported"] or summary["identical"] == 0):
+        print("strict: scenarios the kernel rejects would run in Python, or none is identical")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
