@@ -679,15 +679,18 @@ def compare_solutions(python: GeneticSolution, native: GeneticSolution) -> list[
     )
 
 
-# With a bounded fitness cache, Python's hit/miss counters depend on the number of
-# evaluation workers (a batch looks up all genomes before it stores any); the kernel
-# counts like one worker. The plan does not depend on it.
+# With the fitness cache and more than one evaluation worker, Python's hit/miss counters
+# depend on the number of workers: a parallel batch looks up all genomes before it stores
+# any (bounded cache), and it evaluates identical genomes once even when the evaluation
+# failed, which a serial run does not cache. The kernel counts like one worker. The plan
+# does not depend on it.
 CACHE_COUNTERS = ".fitness_history.fitness_cache."
 
 
 def _counters_depend_on_workers(optimization: GeneticOptimization) -> bool:
     limit = optimization._genetic_cfg.fitness_cache_max_entries
-    return limit is not None and limit > 0 and optimization._configured_evaluation_workers() > 1
+    cache_enabled = limit is None or limit > 0
+    return cache_enabled and optimization._configured_evaluation_workers() > 1
 
 
 @dataclass

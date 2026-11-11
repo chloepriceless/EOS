@@ -155,6 +155,7 @@ def _synthetic_input(
         },
         "inverter": {"device_id": "inverter1", "max_power_wh": 10000, "battery_id": "battery1"},
         "forecast_interval_seconds": interval,
+        "ev": None,
     }
     if ev:
         data["ev"] = {
@@ -701,6 +702,150 @@ class TestNativeEqualsPython:
         assert native_solution.appliance_starts
         if direct_marketing:
             assert native_solution.battery_grid_export_factor
+
+    @staticmethod
+    def _plan(solution: GeneticSolution) -> list[dict[str, Any]]:
+        dump = solution.energy_management_plan().model_dump(mode="json")
+        for instruction in dump["instructions"]:
+            instruction.pop("id", None)
+        return dump["instructions"]
+
+    @staticmethod
+    def _limited_input(
+        *, interval: int, seed: int, limit_w: float, ev: bool = True, **ev_fields: Any
+    ) -> GeneticOptimizationParameters:
+        data = _synthetic_input(
+            slots=48 * 3600 // interval,
+            interval=interval,
+            seed=seed,
+            ev=ev,
+            feed_in_series=True,
+            deadline=ev_fields.pop("deadline", "2026-09-17T07:00:00+02:00"),
+        ).model_dump(mode="json")
+        data["inverter"]["max_grid_import_power_w"] = limit_w
+        data["pv_battery"]["charge_rates"] = [0.0, 0.1, 0.25, 0.5, 1.0]
+        if ev:
+            data["ev"].update(ev_fields)
+        return GeneticOptimizationParameters(**data)
+
+    @pytest.mark.parametrize("interval", [3600, 900])
+    @pytest.mark.parametrize("ev", [False, True])
+    def test_grid_import_limit_with_threshold_peak_shaving(self, config_eos, interval, ev):
+        """Held slots shave the import above the limit; EV charging gives way to it."""
+        _configure(config_eos, interval_sec=interval, horizon_hours=24, tail_horizon_hours=12)
+
+        def make() -> GeneticOptimizationParameters:
+            return self._limited_input(interval=interval, seed=21 + interval, limit_w=900.0, ev=ev)
+
+        python, native_solution = _run_both(config_eos, make, seed=13)
+        assert native.compare_solutions(python, native_solution) == []
+        assert python.result.peak_shaving_wh_per_hour is not None
+        python_plan = self._plan(python)
+        assert native.diff_values(python_plan, self._plan(native_solution)) == []
+        thresholds = {
+            i.get("peak_shaving_threshold_w")
+            for i in python_plan
+            if i.get("resource_id") == "battery1"
+        }
+        assert thresholds == {900.0}
+
+    @pytest.mark.parametrize("interval", [3600, 900])
+    @pytest.mark.parametrize("start", ["2026-09-16T10:07:00+02:00", "2026-09-16T10:52:30+02:00"])
+    def test_run_inside_a_slot_with_grid_limit_and_ev(self, config_eos, interval, start):
+        """A run inside slot 0 charges the EV only for the rest of it (slot 0 split in two)."""
+        _configure(config_eos, interval_sec=interval, horizon_hours=24, tail_horizon_hours=12)
+
+        def make() -> GeneticOptimizationParameters:
+            # A tight limit and an EV deadline inside a slot: the limit lowers EV charging.
+            return self._limited_input(
+                interval=interval,
+                seed=51,
+                limit_w=6000.0,
+                deadline="2026-09-16T23:40:00+02:00",
+                charge_rates=[0.0, 0.375, 0.5, 0.75, 1.0],
+            )
+
+        python, native_solution = _run_both(config_eos, make, seed=23, start=start)
+        assert native.compare_solutions(python, native_solution) == []
+        assert native.diff_values(self._plan(python), self._plan(native_solution)) == []
+
+    @pytest.mark.parametrize("limit_w", [0.0, 300.0])
+    def test_unreachable_grid_import_limit(self, config_eos, limit_w):
+        """A limit below the house load can not be kept; the penalty applies to the rest."""
+        _configure(config_eos, interval_sec=900, horizon_hours=24, tail_horizon_hours=12)
+
+        def make() -> GeneticOptimizationParameters:
+            return self._limited_input(interval=900, seed=61, limit_w=limit_w)
+
+        python, native_solution = _run_both(config_eos, make, seed=29)
+        assert native.compare_solutions(python, native_solution) == []
+
+    @pytest.mark.parametrize("initial", [30, 70])
+    @pytest.mark.parametrize("direct_marketing", [False, True])
+    def test_ev_soc_value_steps(self, config_eos, initial, direct_marketing):
+        """Energy above the EV target earns the steps' value, also for a vehicle at its target."""
+        _configure(
+            config_eos,
+            interval_sec=900,
+            horizon_hours=24,
+            tail_horizon_hours=12,
+            direct_marketing=direct_marketing,
+        )
+
+        def make() -> GeneticOptimizationParameters:
+            data = _synthetic_input(
+                slots=192,
+                interval=900,
+                seed=31 + initial,
+                feed_in_series=True,
+                deadline="2026-09-17T07:10:00+02:00",
+            ).model_dump(mode="json")
+            data["ev"]["initial_soc_percentage"] = initial
+            data["ev"]["max_soc_percentage"] = 95
+            data["ev"]["soc_value_steps"] = [[80.0, 0.3], [90.0, 0.12]]
+            return GeneticOptimizationParameters(**data)
+
+        python, native_solution = _run_both(
+            config_eos, make, seed=17, start="2026-09-16T10:05:00+02:00"
+        )
+        assert native.compare_solutions(python, native_solution) == []
+        assert native_solution.ev_charge_hours_float is not None
+
+    @pytest.mark.parametrize(
+        ("charge_start", "deadline", "max_duration_h"),
+        [
+            # deadline before the charge start: the target is due at the horizon end
+            ("2026-09-16T15:00:00+02:00", "2026-09-16T14:30:00+02:00", None),
+            # charge start already reached: the vehicle charges right away
+            ("2026-09-16T09:00:00+02:00", "2026-09-16T12:00:00+02:00", None),
+            # charge start inside the current slot, deadline inside a later slot
+            ("2026-09-16T10:20:00+02:00", "2026-09-16T20:40:00+02:00", None),
+            # charge start in the horizon, deadline after it
+            ("2026-09-16T13:10:00+02:00", "2026-09-16T20:00:00+02:00", None),
+            # deadline passed: target at the horizon end, the maximum duration still applies
+            (None, "2026-09-16T09:30:00+02:00", 6.5),
+            # maximum duration counted from now
+            (None, None, 3.25),
+        ],
+    )
+    @pytest.mark.parametrize("interval", [3600, 900])
+    def test_ev_charge_start_and_deadline(
+        self, config_eos, charge_start, deadline, max_duration_h, interval
+    ):
+        _configure(config_eos, interval_sec=interval, horizon_hours=24, tail_horizon_hours=12)
+
+        def make() -> GeneticOptimizationParameters:
+            data = _synthetic_input(
+                slots=48 * 3600 // interval, interval=interval, seed=41, deadline=deadline
+            ).model_dump(mode="json")
+            data["ev"]["charge_start_datetime"] = charge_start
+            data["ev"]["min_soc_max_duration_h"] = max_duration_h
+            return GeneticOptimizationParameters(**data)
+
+        python, native_solution = _run_both(
+            config_eos, make, seed=19, start="2026-09-16T10:12:00+02:00"
+        )
+        assert native.compare_solutions(python, native_solution) == []
 
     @pytest.mark.asyncio
     async def test_plan_and_solution_frames(self, config_eos):

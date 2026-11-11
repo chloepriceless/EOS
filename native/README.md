@@ -11,6 +11,7 @@ here is used.
 | `scripts/build-wheels.sh` | Builds Linux wheels for x86_64, aarch64 and armv7 (glibc and musl) with maturin and zig. |
 | `scripts/genetic_compare_plugin.py` | pytest plugin: compares every GENETIC optimization of a test session with the kernel and lists differences. |
 | `scripts/certify.py` | Adds the fingerprint of the current GENETIC sources to `certified.json` after a clean compare run. |
+| `scripts/parity_scenarios.py` | Generates reproducible GENETIC runs (15/60 min, runs inside a slot, grid import limit, EV charge start, deadline, SoC value steps, ...) and compares native with Python on each. |
 
 The EOS side of the interface is `akkudoktoreos.optimization.genetic.native`: it builds the
 kernel request from the configuration snapshot of a run, validates the response into a
@@ -105,6 +106,11 @@ python native/scripts/certify.py compare.json   # only if the summary shows 0 di
   `identical`, `unsupported` (the kernel rejected a request it does not support), `patched`
   (the test replaces parts of the Python optimizer, so a difference is expected), `different`
   and `failed` (any other native error: a panic, an invalid response).
+- `scripts/parity_scenarios.py --count 400` runs generated scenarios in compare mode: hourly and
+  15-minute slots, runs on and inside a slot boundary, direct marketing, AC charge limits, an
+  efficiency curve, a grid import limit (none, tight, unreachable), an EV with charge start,
+  deadline (inside a slot, passed, beyond the horizon), maximum duration and SoC value steps,
+  appliances. Its report has the layout of the compare plugin's.
 - The `native` CI workflow builds the wheels, runs both on x86_64 and aarch64 and fails on any
   `different` or `failed` run, and its summary says whether the sources are certified. It runs
   only when GENETIC sources or `native/` change.
