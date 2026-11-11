@@ -188,7 +188,8 @@ def scenario(seed: int) -> dict[str, Any]:
         "terminal_value_mode": rng.choice(("AUTO", "AUTO", "FIXED")),
         "individuals": rng.choice((40, 60, 80)),
         "generations": rng.choice((15, 25, 35)),
-        "penalties": {"ev_soc_miss": 10, "ac_charge_break_even": 1},
+        # Every penalty explicit (10.0 = the default of grid_import_limit_excess).
+        "penalties": {"ev_soc_miss": 10, "ac_charge_break_even": 1, "grid_import_limit_excess": 10.0},
     }
     if inverter.get("max_grid_import_power_w") is not None and rng.random() < 0.3:
         settings["penalties"]["grid_import_limit_excess"] = rng.choice((2.0, 10.0, 50.0))
@@ -226,6 +227,9 @@ def run_scenario(case: dict[str, Any], ev_rates: Optional[list[float]] = None) -
     from akkudoktoreos.utils.datetimeutil import to_datetime
 
     config = get_config()
+    # Each scenario from the defaults: runtime settings deep-merge, so an optional setting of an
+    # earlier scenario (e.g. a penalty) must not leak into this one.
+    config.reset_settings()
     config.merge_settings_from_dict(
         {
             "general": {"timezone": TIMEZONE},
