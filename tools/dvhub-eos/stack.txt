@@ -1,0 +1,16 @@
+# DVhub-EOS: Zweige, die build-integration.sh in dieser Reihenfolge auf upstream/main merged.
+#
+# Spalten (durch Leerzeichen getrennt):
+#   1. Ref        Remote-Zweig (<remote>/<zweig>), den das Skript vorher holt
+#   2. Herkunft   upstream#<nr>  offener PR bei Akkudoktor-EOS/EOS
+#                 fork#<nr>      in dvhub-eos/main gemergter PR im Fork chloepriceless/EOS
+#                                (noch nicht upstream eingereicht)
+#   3. Pin        optional: Commit-SHA (min. 7 Zeichen), der statt der Zweigspitze gemerged
+#                 wird; muss in der Zweighistorie liegen
+# Alles nach '#' ist Kommentar. Ein Eintrag fällt heraus, sobald upstream ihn gemergt hat
+# (dann steckt er schon in upstream/main) – siehe README.md.
+
+fork/pr/genetic-deterministic-dot          upstream#1518   # np.dot in fester Reihenfolge (bitgleiche Pläne je CPU)
+fork/pr/native-genetic-switch              upstream#1520   # optionaler Rust-Kern für GENETIC (+ Schalter)
+fork/feat/grid-peak-shaving-threshold      upstream#1531   # Netzbezugsgrenze + Peak-Shaving-Schwelle
+fork/feat/ev-soc-value                     upstream#1532   # E-Auto: Ladestart, Seeding, Wert über Ziel-SoC

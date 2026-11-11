@@ -1,0 +1,5 @@
+# Nur für build-integration.sh (git -c core.attributesFile=...): generierte Dateien nie
+# zusammenführen, sondern die bisherige Fassung behalten; das Skript erzeugt sie nach dem
+# letzten Merge mit `make gen-docs` neu.
+/openapi.json merge=dvhub-eos-generated
+/docs/_generated/** merge=dvhub-eos-generated
