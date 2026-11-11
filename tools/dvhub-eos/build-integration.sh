@@ -118,7 +118,7 @@ if [ "$DO_FETCH" = 1 ]; then
   git -C "$REPO_TOP" fetch --quiet "$FORK_REMOTE"
   # Release-Tags zeigen nach einem Neubau auf Commits außerhalb jedes Zweigs; ohne ausdrückliches
   # Holen fehlen sie und das Skript vergäbe ein schon veröffentlichtes dvhub.<N> erneut.
-  git -C "$REPO_TOP" fetch --quiet "$FORK_REMOTE" "refs/tags/$TAG_PREFIX*:refs/tags/$TAG_PREFIX*"
+  git -C "$REPO_TOP" fetch --quiet --no-prune "$FORK_REMOTE" "refs/tags/$TAG_PREFIX*:refs/tags/$TAG_PREFIX*"
 fi
 BASE_SHA=$(git -C "$REPO_TOP" rev-parse --verify "$BASE_REF^{commit}")
 
