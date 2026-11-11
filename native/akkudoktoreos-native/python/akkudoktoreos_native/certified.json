@@ -2,11 +2,11 @@
   "format": 1,
   "entries": [
     {
-      "fingerprint": "sha256:35471d68ed2874704ce98c224fc0ae58a30e688741575db8646d0198baf73740",
+      "fingerprint": "sha256:ac8faa2e2b7cd44ac8b4687c8104dc7f1649ab5bc5a76b329d3ca38eb5846613",
       "kernel_version": "0.2.0",
       "verified": "2026-11-11",
       "evidence": "297 identical runs, 19 not supported natively, 13 with patched Python, 0 different (dot: sequential)",
-      "note": "DVhub-EOS dvhub-eos/main dbfdd49 (Akkudoktor-EOS main 62cbf4c + #1518 + #1520 + #1531 + #1532); GENETIC test suite in compare mode on linux/aarch64; plus 400 of 400 generated scenarios identical (native/scripts/parity_scenarios.py --count 400 --seed 1)"
+      "note": "DVhub-EOS dvhub-eos/main (Akkudoktor-EOS main 62cbf4c + #1518 + #1520 + #1531 + #1532 + fork#1 with the stable terminal value sort); GENETIC test suite and test_terminalvalue in compare mode on linux/aarch64; plus 400 of 400 generated scenarios identical (native/scripts/parity_scenarios.py --count 400 --seed 1 --strict)"
     }
   ]
 }
