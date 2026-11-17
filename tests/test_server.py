@@ -173,6 +173,7 @@ class TestServerStartStop:
         assert msg.endswith("[TRUNCATED]"), "Expected truncation marker"
         assert len(msg) <= EOSDASH_LOG_MAX_LINE_BYTES + 20
 
+    @pytest.mark.eos_server  # binds the fixed EOSdash port without a fixture
     @pytest.mark.asyncio
     async def test_server_start_eosdash(self, config_eos, monkeypatch, tmp_path):
         """Test the EOSdash server startup from EOS.

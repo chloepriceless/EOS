@@ -133,8 +133,13 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip browser tests unless requested, and pin server tests to one xdist worker.
+
+    Runs first (``tryfirst``): xdist reads the ``xdist_group`` marker in its own
+    ``pytest_collection_modifyitems`` on the worker, which is registered after this
+    conftest and would otherwise run before the marker is set here.
 
     Every test that starts an EOS or EOSdash server depends, directly or
     transitively, on the ``xprocess`` fixture and binds fixed ports (8503/8504).
@@ -150,7 +155,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if not browser_requested and item.get_closest_marker("browser") is not None:
             item.add_marker(skip_browser)
-        if "xprocess" in getattr(item, "fixturenames", ()):
+        # 'eos_server' selects the tests that start a real EOS/EOSdash server on the
+        # fixed ports: derived from the xprocess fixture, or set explicitly on a test
+        # that manages the ports without a fixture. CI can run them as their own
+        # serial job (-m eos_server); under xdist they share one worker.
+        if (
+            "xprocess" in getattr(item, "fixturenames", ())
+            and item.get_closest_marker("eos_server") is None
+        ):
+            item.add_marker(pytest.mark.eos_server)
+        if item.get_closest_marker("eos_server") is not None:
             item.add_marker(pytest.mark.xdist_group("eos_server"))
 
 

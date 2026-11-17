@@ -168,7 +168,8 @@ markers = [
     "docker: marks tests that require a local Docker engine",
     "docs: marks the Sphinx documentation build test",
     "browser: marks EOSdash tests that run in a headless browser (enable with --browser-test)",
-    "xdist_group: run tests sharing a group name on the same xdist worker (set automatically for server tests; needs --dist loadgroup)",
+    "eos_server: tests that start a real EOS/EOSdash server on the fixed ports (set automatically for tests using the xprocess fixture)",
+    "xdist_group: run tests sharing a group name on the same xdist worker (derived from eos_server; needs --dist loadgroup)",
 ]
 filterwarnings = [
     # Treat pandas 4 deprecations in EOS code as errors; upstream callers remain visible.
