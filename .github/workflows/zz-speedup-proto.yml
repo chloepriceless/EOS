@@ -201,6 +201,9 @@ jobs:
           done
           echo "COUNT gesamt=$total server=$server summe_der_teile=$sum"
           test "$sum" -eq "$total"
+          # Faellt der Hook still aus, liefen die Server-Tests in den Shards mit und
+          # die Summe stimmte trotzdem; deshalb darf der Server-Teil nicht leer sein.
+          test "$server" -gt 0
 
   genetic:
     # Genetik-Test des neuen Optimierers: 400 Generationen (heute) und 250 (Vorschlag)

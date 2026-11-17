@@ -14,8 +14,12 @@ import sys
 
 
 def shards(k: int) -> list[list[str]]:
-    with open(".ci-test-durations.json", encoding="utf-8") as fd:
-        dur = json.load(fd)
+    try:
+        with open(".ci-test-durations.json", encoding="utf-8") as fd:
+            dur = json.load(fd)
+    except FileNotFoundError:
+        # Ohne Gewichte zaehlt jede Datei 1 s: schlechtere Balance, gleiche Abdeckung.
+        dur = {}
     files = sorted(glob.glob("tests/test_*.py"))
     load = [0.0] * k
     groups: list[list[str]] = [[] for _ in range(k)]

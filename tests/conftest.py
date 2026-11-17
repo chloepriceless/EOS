@@ -146,9 +146,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     Under ``pytest -n`` such tests must not run on two workers at once, or they
     clash on those ports. Tagging them with a shared ``xdist_group`` makes
     xdist's ``--dist loadgroup`` scheduler place them all on the same worker, so
-    they serialise against each other while the ~3500 server-free tests still
-    spread across all workers. The marker is inert without xdist, so serial runs
-    are unaffected.
+    they serialise against each other while the server-free tests still spread
+    across all workers. The marker is inert without xdist, so serial runs are
+    unaffected.
     """
     browser_requested = bool(config.getoption("--browser-test"))
     skip_browser = pytest.mark.skip(reason="browser test: enable with --browser-test")
