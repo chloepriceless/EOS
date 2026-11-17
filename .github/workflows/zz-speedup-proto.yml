@@ -1,0 +1,97 @@
+# PROTOTYP (nicht fuer den Merge) — misst den Test-Speedup auf echten GitHub-
+# Runnern und belegt die Runner-Kernzahl. Manuell ausloesen (workflow_dispatch).
+#
+# Vergleicht drei Varianten des bestehenden `test`-Jobs (Issue #1553), OHNE einen
+# Test wegzulassen:
+#   serial   = heutiger Stand (ein Runner, nacheinander)
+#   xdist    = pytest-xdist -n auto --dist loadgroup (Kerne EINES Runners)
+#   sharded  = pytest-split, 4 parallele Jobs, je zusaetzlich -n auto
+#
+# Wall-Zeit steht je Job in der Actions-UI. `nproc`/lscpu klaeren, wie viele
+# vCPU ein ubuntu-latest-Runner wirklich hat (die 2–4-Kern-Annahme war ungeprueft).
+# Coverage-Gleichheit wird separat seriell-vs-xdist nachgewiesen; hier geht es
+# nur um die Wall-Zeit, deshalb laufen alle drei ohne --cov (fairer Vergleich).
+
+name: zz Speedup Prototype
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTEST_BASE: --finalize --check-config-side-effect -m "not docs and not docker" -q -p "no:randomly"
+
+jobs:
+  runner-info:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Runner-Kerne und CPU belegen
+        run: |
+          echo "nproc = $(nproc)"
+          echo "online CPUs = $(getconf _NPROCESSORS_ONLN)"
+          lscpu | grep -E '^CPU\(s\)|Model name|Thread|Core' || true
+          free -h || true
+
+  serial:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+      - name: Install uv
+        run: python -m pip install --upgrade pip && pip install uv
+      - name: Sync
+        run: uv sync --extra dev
+      - name: Tests (seriell)
+        run: |
+          start=$(date +%s)
+          uv run pytest ${{ env.PYTEST_BASE }} || true
+          echo "SERIAL_WALL_SECONDS=$(( $(date +%s) - start ))"
+
+  xdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+      - name: Install uv
+        run: python -m pip install --upgrade pip && pip install uv
+      - name: Sync
+        run: uv sync --extra dev
+      - name: Tests (xdist -n auto)
+        run: |
+          echo "nproc = $(nproc)"
+          start=$(date +%s)
+          uv run pytest ${{ env.PYTEST_BASE }} -n auto --dist loadgroup || true
+          echo "XDIST_WALL_SECONDS=$(( $(date +%s) - start ))"
+
+  sharded:
+    # 4 parallele Runner (Sharding ueber Maschinen), je zusaetzlich xdist ueber
+    # die Kerne. Jeder Test laeuft genau EINMAL, nur in seinem Shard.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+      - name: Install uv
+        run: python -m pip install --upgrade pip && pip install uv
+      - name: Sync
+        run: uv sync --extra dev
+      - name: Tests (Shard ${{ matrix.group }}/4, je -n auto)
+        # Nutzt .test_durations fuer dauerbalancierte Shards, falls vorhanden;
+        # sonst faellt pytest-split auf gleiche Testzahl pro Shard zurueck.
+        run: |
+          start=$(date +%s)
+          uv run pytest ${{ env.PYTEST_BASE }} \
+            --splits 4 --group ${{ matrix.group }} \
+            -n auto --dist loadgroup || true
+          echo "SHARD_${{ matrix.group }}_WALL_SECONDS=$(( $(date +%s) - start ))"
