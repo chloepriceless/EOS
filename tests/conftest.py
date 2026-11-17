@@ -134,13 +134,24 @@ def pytest_addoption(parser):
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip the browser tests unless --browser-test is given."""
-    if config.getoption("--browser-test"):
-        return
+    """Skip browser tests unless requested, and pin server tests to one xdist worker.
+
+    Every test that starts an EOS or EOSdash server depends, directly or
+    transitively, on the ``xprocess`` fixture and binds fixed ports (8503/8504).
+    Under ``pytest -n`` such tests must not run on two workers at once, or they
+    clash on those ports. Tagging them with a shared ``xdist_group`` makes
+    xdist's ``--dist loadgroup`` scheduler place them all on the same worker, so
+    they serialise against each other while the ~3500 server-free tests still
+    spread across all workers. The marker is inert without xdist, so serial runs
+    are unaffected.
+    """
+    browser_requested = bool(config.getoption("--browser-test"))
     skip_browser = pytest.mark.skip(reason="browser test: enable with --browser-test")
     for item in items:
-        if item.get_closest_marker("browser") is not None:
+        if not browser_requested and item.get_closest_marker("browser") is not None:
             item.add_marker(skip_browser)
+        if "xprocess" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.xdist_group("eos_server"))
 
 
 @pytest.fixture(scope="class")
