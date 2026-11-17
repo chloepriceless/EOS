@@ -1,19 +1,16 @@
-# PROTOTYP (nicht fuer den Merge) — misst den Test-Speedup auf echten GitHub-
-# Runnern und belegt die Runner-Kernzahl. Laeuft automatisch beim Push auf den
-# Mess-Branch `speedup-proto-measure` (umgeht die workflow_dispatch-Default-
-# Branch-Huerde bei Forks).
+# PROTOTYP (nicht fuer den Merge) — Messreihe zum Test-Speedup auf echten GitHub-
+# Runnern (Issue #1553 / PR #1564). Laeuft beim Push auf `speedup-proto-measure`.
 #
-# Vergleicht drei Varianten des bestehenden `test`-Jobs (Issue #1553), OHNE einen
-# Test wegzulassen:
-#   serial   = heutiger Stand (ein Runner, nacheinander)
-#   xdist    = pytest-xdist -n auto --dist loadgroup (Kerne EINES Runners)
-#   sharded  = plugin-freier Datei-Shard (4 parallele Runner), je zusaetzlich xdist
-#
-# Wall-Zeit steht je Job in der Actions-UI. `nproc`/lscpu klaeren, wie viele vCPU
-# ein ubuntu-latest-Runner wirklich hat. HINWEIS: Solange der SQLite-Reopen-
-# Produktionsbug (database.py) nicht gefixt ist, schlagen unter xdist ~10 SQLite-
-# Tests fehl; `|| true` haelt die Zeitmessung trotzdem fest. Nach dem Fix sauber
-# nachmessen.
+# Frage dieser Runde: Wie viel der Test-Job-Zeit ist Coverage-Messaufwand, und
+# bleibt der Coverage-Bericht gleich, wenn der Mess-Kern gewechselt wird?
+#   pr-exact      = exakt der Befehl aus pytest.yml, Standard-Kern (CTracer), 2x
+#   pr-sysmon     = derselbe Befehl mit COVERAGE_CORE=sysmon (sys.monitoring), 2x
+#   q-nocov       = ohne Coverage (Untergrenze)
+#   xdist-sysmon  = sysmon + pytest-xdist -n auto --dist loadgroup
+#   sharded-sysmon= 4 dauerbalancierte Shards (LPT), je xdist + sysmon,
+#                   Coverage-Daten als Artefakt -> shard-coverage fuehrt zusammen
+# Jeder Coverage-Job schreibt `coverage report -m` nach cov.txt (Artefakt + sha256),
+# damit die Berichte zeilenweise verglichen werden koennen. Kein Test faellt weg.
 
 name: zz Speedup Prototype
 
@@ -25,7 +22,7 @@ on:
     branches: [speedup-proto-measure]
 
 env:
-  PYTEST_BASE: --finalize --check-config-side-effect -m "not docs and not docker" -q -p "no:randomly"
+  PYTEST_SEL: --finalize --check-config-side-effect -m "not docs and not docker"
 
 jobs:
   runner-info:
@@ -34,11 +31,84 @@ jobs:
       - name: Runner-Kerne und CPU belegen
         run: |
           echo "nproc = $(nproc)"
-          echo "online CPUs = $(getconf _NPROCESSORS_ONLN)"
-          lscpu | grep -E '^CPU\(s\)|Model name|Thread|Core' || true
-          free -h || true
+          lscpu | grep -E '^CPU\(s\)|Model name' || true
 
-  serial:
+  pr-exact:
+    # Exakt der Test-Schritt aus pytest.yml (Standard-Kern), zweimal fuer die Streuung.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+      - name: Install uv
+        run: python -m pip install --upgrade pip && pip install uv
+      - name: Sync
+        run: uv sync --extra dev
+      - name: Aktiver Coverage-Kern
+        run: |
+          printf 'import coverage\nc = coverage.Coverage.current()\nprint("CORE =", c._collector.tracer_name())\n' > /tmp/which_core.py
+          uv run coverage run --data-file=/tmp/.cov_probe /tmp/which_core.py
+      - name: Tests (PR-Befehl, CTracer)
+        run: |
+          echo "nproc = $(nproc)"
+          start=$(date +%s)
+          uv run pytest ${{ env.PYTEST_SEL }} -vs --durations=25 --cov src --cov-report term-missing || true
+          echo "WALL_SECONDS=$(( $(date +%s) - start ))"
+      - name: Coverage-Bericht
+        run: |
+          uv run coverage report -m > cov.txt || true
+          sha256sum cov.txt
+          tail -n 1 cov.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cov-pr-exact-${{ matrix.rep }}
+          path: cov.txt
+
+  pr-sysmon:
+    # Derselbe Befehl, nur der Mess-Kern ist sys.monitoring.
+    runs-on: ubuntu-latest
+    env:
+      COVERAGE_CORE: sysmon
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+      - name: Install uv
+        run: python -m pip install --upgrade pip && pip install uv
+      - name: Sync
+        run: uv sync --extra dev
+      - name: Aktiver Coverage-Kern
+        run: |
+          printf 'import coverage\nc = coverage.Coverage.current()\nprint("CORE =", c._collector.tracer_name())\n' > /tmp/which_core.py
+          uv run coverage run --data-file=/tmp/.cov_probe /tmp/which_core.py
+      - name: Tests (PR-Befehl, sysmon)
+        run: |
+          echo "nproc = $(nproc)"
+          start=$(date +%s)
+          uv run pytest ${{ env.PYTEST_SEL }} -vs --durations=25 --cov src --cov-report term-missing || true
+          echo "WALL_SECONDS=$(( $(date +%s) - start ))"
+      - name: Coverage-Bericht
+        run: |
+          uv run coverage report -m > cov.txt || true
+          sha256sum cov.txt
+          tail -n 1 cov.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cov-pr-sysmon-${{ matrix.rep }}
+          path: cov.txt
+
+  q-nocov:
+    # Untergrenze: dieselben Tests ganz ohne Coverage.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,15 +119,16 @@ jobs:
         run: python -m pip install --upgrade pip && pip install uv
       - name: Sync
         run: uv sync --extra dev
-      - name: Tests (seriell)
+      - name: Tests (ohne Coverage)
         run: |
-          echo "nproc = $(nproc)"
           start=$(date +%s)
-          uv run pytest ${{ env.PYTEST_BASE }} || true
-          echo "SERIAL_WALL_SECONDS=$(( $(date +%s) - start ))"
+          uv run pytest ${{ env.PYTEST_SEL }} -q --durations=25 || true
+          echo "WALL_SECONDS=$(( $(date +%s) - start ))"
 
-  xdist:
+  xdist-sysmon:
     runs-on: ubuntu-latest
+    env:
+      COVERAGE_CORE: sysmon
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -67,21 +138,29 @@ jobs:
         run: python -m pip install --upgrade pip && pip install uv
       - name: Sync
         run: uv sync --extra dev
-      - name: Tests (xdist -n auto)
+      - name: Tests (xdist + sysmon)
         run: |
-          echo "nproc = $(nproc)"
           start=$(date +%s)
-          uv run pytest ${{ env.PYTEST_BASE }} -n auto --dist loadgroup || true
-          echo "XDIST_WALL_SECONDS=$(( $(date +%s) - start ))"
+          uv run pytest ${{ env.PYTEST_SEL }} -q --durations=25 -n auto --dist loadgroup --cov src --cov-report term-missing || true
+          echo "WALL_SECONDS=$(( $(date +%s) - start ))"
+      - name: Coverage-Bericht
+        run: |
+          uv run coverage report -m > cov.txt || true
+          sha256sum cov.txt
+          tail -n 1 cov.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cov-xdist-sysmon
+          path: cov.txt
 
-  sharded:
-    # 4 parallele Runner (Sharding ueber Maschinen), je zusaetzlich xdist ueber die
-    # Kerne. Plugin-frei: Jeder Shard bekommt eine disjunkte Teilmenge der
-    # Testdateien (Round-Robin ueber die sortierte Dateiliste). Jeder Test laeuft
-    # genau EINMAL, nur in seinem Shard. Nicht dauerbalanciert — fuer die
-    # finale Fassung die schweren Dateien (genetic*, energycharts, database)
-    # gezielt verteilen.
+  sharded-sysmon:
+    # 4 dauerbalancierte Shards (Greedy-LPT ueber .ci-test-durations.json), je xdist
+    # + sysmon. Jeder Test laeuft genau einmal. Die Coverage-Daten jedes Shards gehen
+    # als Artefakt an shard-coverage.
     runs-on: ubuntu-latest
+    env:
+      COVERAGE_CORE: sysmon
+      COVERAGE_FILE: covdata.shard${{ matrix.group }}
     strategy:
       fail-fast: false
       matrix:
@@ -95,10 +174,8 @@ jobs:
         run: python -m pip install --upgrade pip && pip install uv
       - name: Sync
         run: uv sync --extra dev
-      - name: Tests (dauerbalancierter Shard ${{ matrix.group }}/4, je -n auto)
+      - name: Tests (Shard ${{ matrix.group }}/4, xdist + sysmon)
         run: |
-          # Greedy-LPT: schwerste Dateien zuerst auf den jeweils leichtesten Shard.
-          # Laufzeiten aus .ci-test-durations.json; unbekannte (neue) Dateien = 1 s.
           FILES=$(python - <<'PY'
           import glob, json
           dur = json.load(open(".ci-test-durations.json"))
@@ -114,5 +191,42 @@ jobs:
           )
           echo "Shard ${{ matrix.group }} Dateien: $(echo $FILES | wc -w)"
           start=$(date +%s)
-          uv run pytest ${{ env.PYTEST_BASE }} -n auto --dist loadgroup $FILES || true
-          echo "SHARD_${{ matrix.group }}_WALL_SECONDS=$(( $(date +%s) - start ))"
+          uv run pytest ${{ env.PYTEST_SEL }} -q --durations=10 -n auto --dist loadgroup --cov src --cov-report= $FILES || true
+          echo "WALL_SECONDS=$(( $(date +%s) - start ))"
+          ls -la covdata.shard* || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: covdata-shard-${{ matrix.group }}
+          path: covdata.shard${{ matrix.group }}
+
+  shard-coverage:
+    # Fuehrt die Coverage-Daten der Shards zu EINEM Bericht zusammen.
+    needs: sharded-sysmon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13.15"
+      - name: Install uv
+        run: python -m pip install --upgrade pip && pip install uv
+      - name: Sync
+        run: uv sync --extra dev
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: covdata-shard-*
+          path: covdata
+          merge-multiple: true
+      - name: Zusammenfuehren + Bericht
+        run: |
+          ls -la covdata
+          start=$(date +%s)
+          uv run coverage combine covdata/covdata.shard*
+          uv run coverage report -m > cov.txt || true
+          echo "COMBINE_SECONDS=$(( $(date +%s) - start ))"
+          sha256sum cov.txt
+          tail -n 1 cov.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cov-sharded-combined
+          path: cov.txt
