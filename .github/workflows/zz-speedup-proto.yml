@@ -95,13 +95,21 @@ jobs:
         run: python -m pip install --upgrade pip && pip install uv
       - name: Sync
         run: uv sync --extra dev
-      - name: Tests (Datei-Shard ${{ matrix.group }}/4, je -n auto)
+      - name: Tests (dauerbalancierter Shard ${{ matrix.group }}/4, je -n auto)
         run: |
+          # Greedy-LPT: schwerste Dateien zuerst auf den jeweils leichtesten Shard.
+          # Laufzeiten aus .ci-test-durations.json; unbekannte (neue) Dateien = 1 s.
           FILES=$(python - <<'PY'
-          import glob
+          import glob, json
+          dur = json.load(open(".ci-test-durations.json"))
           files = sorted(glob.glob("tests/test_*.py"))
           k, g = 4, ${{ matrix.group }}
-          print(" ".join(f for i, f in enumerate(files) if i % k == g))
+          load = [0.0] * k
+          groups = [[] for _ in range(k)]
+          for fn in sorted(files, key=lambda f: -dur.get(f, 1.0)):
+              i = min(range(k), key=lambda j: load[j])
+              groups[i].append(fn); load[i] += dur.get(fn, 1.0)
+          print(" ".join(groups[g]))
           PY
           )
           echo "Shard ${{ matrix.group }} Dateien: $(echo $FILES | wc -w)"
