@@ -1,11 +1,15 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pytest
 import yaml
 from pydantic import ValidationError
+
+from akkudoktoreos.adapter.homeassistant import HomeAssistantAdapter
+from akkudoktoreos.core.emplan import FRBCInstruction
+from akkudoktoreos.utils.datetimeutil import to_datetime
 
 
 class TestHomeAssistantAddon:
@@ -337,3 +341,28 @@ class TestHomeAssistantAddon:
         assert ports[port_key] is None, "Ingress port must be unpublished by default"
 
         print(f"✓ Ingress configuration valid (port {ingress_port})")
+
+
+class TestHomeAssistantInstructionAttributes:
+    @staticmethod
+    def _instruction(**kwargs: Any) -> FRBCInstruction:
+        return FRBCInstruction(
+            resource_id="battery1",
+            actuator_id="battery1",
+            execution_time=to_datetime("2026-10-26T00:00:00"),
+            operation_mode_id="IDLE",
+            operation_mode_factor=1.0,
+            **kwargs,
+        )
+
+    def test_attributes_without_threshold(self) -> None:
+        attributes = HomeAssistantAdapter._instruction_attributes(self._instruction())
+
+        assert attributes == {"operation_mode_factor": 1.0}
+
+    def test_attributes_carry_the_peak_shaving_threshold(self) -> None:
+        attributes = HomeAssistantAdapter._instruction_attributes(
+            self._instruction(peak_shaving_threshold_w=8000.0)
+        )
+
+        assert attributes == {"operation_mode_factor": 1.0, "peak_shaving_threshold_w": 8000.0}

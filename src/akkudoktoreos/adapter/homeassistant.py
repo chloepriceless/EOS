@@ -1,7 +1,7 @@
 """Home Assistant adapter."""
 
 import os
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import pandas as pd
 import requests
@@ -275,6 +275,24 @@ class HomeAssistantAdapter(AdapterProvider):
         except Exception:
             solution_entity_ids = []
         return solution_entity_ids
+
+    @staticmethod
+    def _instruction_attributes(
+        instruction: Union[DDBCInstruction, FRBCInstruction],
+    ) -> dict[str, Any]:
+        """Entity attributes of a device instruction.
+
+        ``peak_shaving_threshold_w`` is only present when the instruction carries one.
+        """
+        attributes: dict[str, Any] = {
+            "operation_mode_factor": instruction.operation_mode_factor,
+        }
+        if (
+            isinstance(instruction, FRBCInstruction)
+            and instruction.peak_shaving_threshold_w is not None
+        ):
+            attributes["peak_shaving_threshold_w"] = instruction.peak_shaving_threshold_w
+        return attributes
 
     def _entity_id_from_resource_id(self, resource_id: str) -> str:
         return HOMEASSISTANT_ENTITY_ID_PREFIX + resource_id
@@ -587,9 +605,7 @@ class HomeAssistantAdapter(AdapterProvider):
                     if entity_id in entity_ids:
                         if isinstance(instruction, (DDBCInstruction, FRBCInstruction)):
                             state = instruction.operation_mode_id.lower()
-                            attributes = {
-                                "operation_mode_factor": instruction.operation_mode_factor,
-                            }
+                            attributes = self._instruction_attributes(instruction)
                             try:
                                 self.set_entity_state(entity_id, state, attributes)
                             except Exception as e:
