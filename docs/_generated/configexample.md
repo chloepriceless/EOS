@@ -69,7 +69,9 @@
                        1.0
                    ],
                    "min_soc_deadline_datetime": null,
-                   "min_soc_max_duration_h": null
+                   "min_soc_max_duration_h": null,
+                   "charge_start_datetime": null,
+                   "soc_value_steps": null
                }
            },
            "max_batteries": 1,
@@ -106,7 +108,9 @@
                        1.0
                    ],
                    "min_soc_deadline_datetime": null,
-                   "min_soc_max_duration_h": null
+                   "min_soc_max_duration_h": null,
+                   "charge_start_datetime": null,
+                   "soc_value_steps": null
                }
            },
            "max_electric_vehicles": 1,

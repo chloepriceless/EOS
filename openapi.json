@@ -3464,7 +3464,7 @@
               }
             ],
             "title": "Min Soc Deadline Datetime",
-            "description": "Absolute moment by which 'min_soc_percentage' has to be reached (departure time). A date time without timezone is read as local time. None means end of the optimization horizon.",
+            "description": "Absolute moment by which 'min_soc_percentage' has to be reached (departure time). A date time without timezone is read as local time. None means end of the optimization horizon. GENETIC treats a deadline that has passed like None, with a warning while the target is not reached.",
             "examples": [
               null,
               "2026-07-16T07:00:00+02:00"
@@ -3488,6 +3488,73 @@
             "examples": [
               null,
               6.0
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
+          "charge_start_datetime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charge Start Datetime",
+            "description": "Earliest absolute moment from which the electric vehicle may charge (electric vehicles only; ignored for stationary batteries). 'min_soc_deadline_datetime' only sets when the target state of charge has to be reached; charging may continue after it. Use it for a vehicle that is not connected yet (e.g. its expected arrival or plug-in time) or for a connected vehicle that may only charge from a given time on. Before it the vehicle neither charges nor discharges, and its state of charge stays at the initial state of charge (for a vehicle that is not connected yet: the state of charge expected at the charge start). A slot that begins before this moment is not used for charging. A date time without timezone is read as local time. None means the vehicle can charge from the start of the optimization.",
+            "examples": [
+              null,
+              "2026-07-15T20:00:00+02:00"
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
+          "soc_value_steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "prefixItems": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ],
+                  "type": "array",
+                  "maxItems": 2,
+                  "minItems": 2
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Soc Value Steps",
+            "description": "Electric vehicles only. Value of energy stored in the vehicle above 'min_soc_percentage', as steps [[soc_percentage, amount_per_kwh], ...] with strictly ascending state of charge in ]0, 100] and finite, non-negative amounts that do not rise with the state of charge. Every kWh stored (SoC energy, after charging losses) between the previous step - at first 'min_soc_percentage' - and a step's state of charge, at most 'max_soc_percentage', is credited with that step's amount at the moment the target is checked: the deadline, or else the end of the control horizon. The optimizer then charges beyond the target where that costs less than the value, e.g. in a cheap night or from PV surplus. Energy below the target earns nothing, so the target keeps its penalty. None or an empty list: energy above the target earns no credit, as before. Used by GENETIC.",
+            "examples": [
+              null,
+              [
+                [
+                  80,
+                  0.25
+                ]
+              ],
+              [
+                [
+                  60,
+                  0.3
+                ],
+                [
+                  80,
+                  0.22
+                ]
+              ]
             ],
             "x-scope": [
               "GENETIC"
@@ -3711,7 +3778,7 @@
               }
             ],
             "title": "Min Soc Deadline Datetime",
-            "description": "Absolute moment by which 'min_soc_percentage' has to be reached (departure time). A date time without timezone is read as local time. None means end of the optimization horizon.",
+            "description": "Absolute moment by which 'min_soc_percentage' has to be reached (departure time). A date time without timezone is read as local time. None means end of the optimization horizon. GENETIC treats a deadline that has passed like None, with a warning while the target is not reached.",
             "examples": [
               null,
               "2026-07-16T07:00:00+02:00"
@@ -3735,6 +3802,73 @@
             "examples": [
               null,
               6.0
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
+          "charge_start_datetime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charge Start Datetime",
+            "description": "Earliest absolute moment from which the electric vehicle may charge (electric vehicles only; ignored for stationary batteries). 'min_soc_deadline_datetime' only sets when the target state of charge has to be reached; charging may continue after it. Use it for a vehicle that is not connected yet (e.g. its expected arrival or plug-in time) or for a connected vehicle that may only charge from a given time on. Before it the vehicle neither charges nor discharges, and its state of charge stays at the initial state of charge (for a vehicle that is not connected yet: the state of charge expected at the charge start). A slot that begins before this moment is not used for charging. A date time without timezone is read as local time. None means the vehicle can charge from the start of the optimization.",
+            "examples": [
+              null,
+              "2026-07-15T20:00:00+02:00"
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
+          "soc_value_steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "prefixItems": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ],
+                  "type": "array",
+                  "maxItems": 2,
+                  "minItems": 2
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Soc Value Steps",
+            "description": "Electric vehicles only. Value of energy stored in the vehicle above 'min_soc_percentage', as steps [[soc_percentage, amount_per_kwh], ...] with strictly ascending state of charge in ]0, 100] and finite, non-negative amounts that do not rise with the state of charge. Every kWh stored (SoC energy, after charging losses) between the previous step - at first 'min_soc_percentage' - and a step's state of charge, at most 'max_soc_percentage', is credited with that step's amount at the moment the target is checked: the deadline, or else the end of the control horizon. The optimizer then charges beyond the target where that costs less than the value, e.g. in a cheap night or from PV surplus. Energy below the target earns nothing, so the target keeps its penalty. None or an empty list: energy above the target earns no credit, as before. Used by GENETIC.",
+            "examples": [
+              null,
+              [
+                [
+                  80,
+                  0.25
+                ]
+              ],
+              [
+                [
+                  60,
+                  0.3
+                ],
+                [
+                  80,
+                  0.22
+                ]
+              ]
             ],
             "x-scope": [
               "GENETIC"
@@ -5686,7 +5820,7 @@
               }
             ],
             "title": "Min Soc Deadline Datetime",
-            "description": "Absolute moment by which 'min_soc_percentage' has to be reached (departure time). A date time without timezone is read as local time. None means end of the optimization horizon.",
+            "description": "Absolute moment by which 'min_soc_percentage' has to be reached (departure time). A date time without timezone is read as local time. None means end of the optimization horizon. GENETIC treats a deadline that has passed like None, with a warning while the target is not reached.",
             "examples": [
               null,
               "2026-07-16T07:00:00+02:00"
@@ -5707,6 +5841,67 @@
             "examples": [
               null,
               6.0
+            ]
+          },
+          "charge_start_datetime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charge Start Datetime",
+            "description": "Earliest absolute moment from which the electric vehicle may charge. 'min_soc_deadline_datetime' only sets when the target state of charge has to be reached; charging may continue after it. Use it for a vehicle that is not connected yet (e.g. its expected arrival or plug-in time) or for a connected vehicle that may only charge from a given time on. Before it the vehicle neither charges nor discharges, and its state of charge stays at 'initial_soc_percentage' (for a vehicle that is not connected yet: the state of charge expected at the charge start). A slot that begins before this moment is not used for charging. A date time without timezone is read as local time. None means the vehicle can charge from the start of the optimization.",
+            "examples": [
+              null,
+              "2026-07-15T20:00:00+02:00"
+            ]
+          },
+          "soc_value_steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "prefixItems": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ],
+                  "type": "array",
+                  "maxItems": 2,
+                  "minItems": 2
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Soc Value Steps",
+            "description": "Electric vehicles only. Value of energy stored in the vehicle above 'min_soc_percentage', as steps [[soc_percentage, amount_per_kwh], ...] with strictly ascending state of charge in ]0, 100] and finite, non-negative amounts that do not rise with the state of charge. Every kWh stored (SoC energy, after charging losses) between the previous step - at first 'min_soc_percentage' - and a step's state of charge, at most 'max_soc_percentage', is credited with that step's amount at the moment the target is checked: the deadline, or else the end of the control horizon. The optimizer then charges beyond the target where that costs less than the value, e.g. in a cheap night or from PV surplus. Energy below the target earns nothing, so the target keeps its penalty. None or an empty list: energy above the target earns no credit, as before. Used by GENETIC.",
+            "examples": [
+              null,
+              [
+                [
+                  80,
+                  0.25
+                ]
+              ],
+              [
+                [
+                  60,
+                  0.3
+                ],
+                [
+                  80,
+                  0.22
+                ]
+              ]
             ]
           }
         },
@@ -6322,6 +6517,23 @@
             "minimum": 0.0,
             "title": "Operation Mode Factor",
             "description": "Factor for the operation mode configuration (0 to 1)."
+          },
+          "peak_shaving_threshold_w": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peak Shaving Threshold W",
+            "description": "Grid import power [W] the site should not exceed while this instruction is active. Charging from the grid is reduced to stay within it, and where the operation mode holds the battery, the battery still discharges to cover the import above it (threshold peak shaving). Where the mode already discharges for the local load, it changes nothing. None means no threshold.",
+            "examples": [
+              null,
+              8000
+            ]
           },
           "resource_id": {
             "type": "string",
@@ -9546,6 +9758,21 @@
             "title": "Electricity Price",
             "description": "Used Electricity Price, including predictions"
           },
+          "peak_shaving_wh_per_hour": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peak Shaving Wh Per Hour",
+            "description": "AC energy in watt-hours per slot that the battery delivered in slots where the plan holds it (discharge_allowed = 0), to cover the grid import above the inverter's max_grid_import_power_w (threshold peak shaving). 0 where it shaved nothing, including released slots. None without a grid import limit."
+          },
           "home_appliance_energy_wh": {
             "additionalProperties": {
               "items": {
@@ -11491,6 +11718,26 @@
               "GENETIC"
             ]
           },
+          "max_grid_import_power_w": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Grid Import Power W",
+            "description": "Maximum power drawn from the grid [W], e.g. the capacity limit of a grid connection with interval metering. The optimizer lowers EV charging (to the highest EV charge rate that fits, with the battery's share counted) and reduces AC charging so that load plus charging stays within the limit; an EV target that does not fit is missed. Where the plan holds the battery, it still covers the import above the limit (threshold peak shaving); the battery instructions of the energy management plan carry the limit as peak_shaving_threshold_w for the site controller. Import the battery cannot cover is penalised with optimization.genetic.penalties.grid_import_limit_excess, so the plan keeps reserve for peaks. null means no limit. Default null.",
+            "examples": [
+              null,
+              8000
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
           "battery_id": {
             "anyOf": [
               {
@@ -11961,6 +12208,26 @@
             "examples": [
               false,
               true
+            ],
+            "x-scope": [
+              "GENETIC"
+            ]
+          },
+          "max_grid_import_power_w": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Grid Import Power W",
+            "description": "Maximum power drawn from the grid [W], e.g. the capacity limit of a grid connection with interval metering. The optimizer lowers EV charging (to the highest EV charge rate that fits, with the battery's share counted) and reduces AC charging so that load plus charging stays within the limit; an EV target that does not fit is missed. Where the plan holds the battery, it still covers the import above the limit (threshold peak shaving); the battery instructions of the energy management plan carry the limit as peak_shaving_threshold_w for the site controller. Import the battery cannot cover is penalised with optimization.genetic.penalties.grid_import_limit_excess, so the plan keeps reserve for peaks. null means no limit. Default null.",
+            "examples": [
+              null,
+              8000
             ],
             "x-scope": [
               "GENETIC"
@@ -12447,6 +12714,23 @@
             "examples": [
               false,
               true
+            ]
+          },
+          "max_grid_import_power_w": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Grid Import Power W",
+            "description": "Maximum power drawn from the grid in watts, e.g. the capacity limit of a grid connection with interval metering. In every slot, EV charging is lowered to the highest EV charge rate that fits (with the battery's share counted) and AC charging of the battery is reduced so that load plus charging stays within the limit; an EV target that does not fit is missed. Where the plan holds the battery, it still covers the import above the limit (threshold peak shaving); the exported battery instructions carry the limit as peak_shaving_threshold_w. Import the battery cannot cover adds the 'grid_import_limit_excess' penalty to the fitness, so the optimizer keeps reserve for peaks. None means no limit.",
+            "examples": [
+              null,
+              8000
             ]
           }
         },
