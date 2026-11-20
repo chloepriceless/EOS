@@ -58,6 +58,13 @@ from akkudoktoreos.optimization.genetic.terminalvalue import TerminalValueCurve
 from akkudoktoreos.utils.datetimeutil import to_datetime
 
 LIMIT_W = 8000.0
+
+# v0.4.0rc3 has no upstream #1423 (EVs finish within a slot); see the commit message.
+RC3_WITHOUT_1423 = (
+    "v0.4.0rc3 lacks upstream #1423: an EV request above its room is lowered to the "
+    "highest charge rate that fits, so the vehicle cannot fill up exactly. OPEN "
+    "DECISION: take #1423 or keep rc3 (then adapt the expectation)."
+)
 SLOTS = 4
 
 
@@ -596,23 +603,21 @@ class TestEvChargingWithinTheLimit:
         assert sim.ev_charge_hours is not None
         assert sim.ev_charge_hours[0] == 0.5
 
+    @pytest.mark.xfail(strict=True, reason=RC3_WITHOUT_1423)
     def test_ev_that_fills_up_within_the_slot_is_not_lowered(self, config_eos):
-        """EV at 97 % (1.8 kWh room) with 6 kWh load: the limit does not lower it.
+        """EV at 97 % (1.8 kWh room) with 6 kWh load: 7.8 kWh fit, the rate stays 1.0.
 
-        The limit is an energy per slot (interval metering). In v0.4.0rc3 the
-        EV itself already takes the highest charge rate whose slot energy fits
-        its room (0.2 x 7 kW = 1.4 kWh, ``Battery.charge_energy`` mode 2;
-        upstream main lets it finish at the requested rate, #1423, which rc3
-        does not have). 7.4 kWh fit the limit, so the limit search keeps that
-        rate.
+        The limit is an energy per slot (interval metering); the EV draws only
+        what it has room for. (v0.4.0rc3 without #1423 lowers the EV itself to
+        the rate that fits its room: 0.2, 7.4 kWh.)
         """
         result, sim = _simulate(
             config_eos, load=[6000.0, 0.0], ev_charge=[1.0, 0.0], soc_percentage=0, ev_soc=97
         )
 
-        assert result["Netzbezug_Wh_pro_Stunde"][0] == pytest.approx(7400.0)
+        assert result["Netzbezug_Wh_pro_Stunde"][0] == pytest.approx(7800.0)
         assert sim.ev_charge_hours is not None
-        assert sim.ev_charge_hours[0] == 0.2
+        assert sim.ev_charge_hours[0] == 1.0
 
     @pytest.mark.parametrize("pv_wh", [300.0, 600.0])
     def test_lowered_slot_equals_a_fresh_simulation_with_neutral_dc(self, config_eos, pv_wh):
@@ -625,7 +630,7 @@ class TestEvChargingWithinTheLimit:
         does. Otherwise the stale permission would charge the held battery
         from PV the plan does not allow.
         """
-        common = dict(
+        common: dict[str, Any] = dict(
             load=[2000.0, 0.0],
             pv=[pv_wh, 0.0],
             dc=[0.0, 0.0],
