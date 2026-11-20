@@ -283,6 +283,103 @@ def _ev_rates(optimizer: GeneticOptimization, genome: list[int]) -> list[float]:
     return [optimizer.ev_possible_charge_values[index] for index in ev_genes]
 
 
+
+def _simulate_slot0_neutral_dc(pv_wh: float, load_wh: float) -> tuple[dict[str, Any], Any]:
+    """Run at half of slot 0, plan without DC permission, rc3 neutral DC (#1397) on.
+
+    Like ``_simulate_slot0`` (8 kW limit, EV asked at 7 kW, empty held battery),
+    with PV in slot 0 and ``dc_charge = 0`` in every slot. Slot 0 is simulated
+    in two parts: the passed half without and the half ahead with the EV.
+    """
+    slots = 3
+    ev_options: dict[str, Any] = {"first_slot_share": 0.5}
+    battery = Battery(
+        SolarPanelBatteryParameters(
+            device_id="battery1",
+            capacity_wh=10000,
+            initial_soc_percentage=0,
+            min_soc_percentage=0,
+            max_soc_percentage=100,
+            charging_efficiency=1.0,
+            discharging_efficiency=1.0,
+            max_charge_power_w=5000,
+        ),
+        prediction_hours=slots,
+    )
+    inverter = Inverter(
+        InverterParameters(
+            device_id="inverter1",
+            max_power_wh=10000,
+            battery_id="battery1",
+            ac_to_dc_efficiency=1.0,
+            dc_to_ac_efficiency=1.0,
+            max_grid_import_power_w=LIMIT_W,
+        ),
+        battery=battery,
+    )
+    ev = Battery(
+        ElectricVehicleParameters(
+            device_id="ev1",
+            capacity_wh=60000,
+            charging_efficiency=1.0,
+            discharging_efficiency=1.0,
+            max_charge_power_w=EV_POWER_W,
+            initial_soc_percentage=0,
+            min_soc_percentage=100,
+            charge_rates=[0.0, 0.25, 0.5, 0.75, 1.0],
+        ),
+        prediction_hours=slots,
+        **ev_options,
+    )
+    simulation = GeneticSimulation()
+    simulation.prepare(
+        GeneticEnergyManagementParameters(
+            pv_forecast_wh=[pv_wh, 0.0, 0.0],
+            electricity_price_per_wh=[0.0003] * slots,
+            feed_in_tariff_per_wh=0.00008,
+            price_per_wh_battery=0.0,
+            total_load=[load_wh, 1000.0, 1000.0],
+        ),
+        optimization_hours=slots,
+        prediction_hours=slots,
+        inverter=inverter,
+        ev=ev,
+    )
+    simulation.reset()
+    simulation.ac_charge_hours = np.zeros(slots)
+    simulation.dc_charge_hours = np.zeros(slots)
+    simulation.bat_discharge_hours = np.zeros(slots)
+    simulation.ev_charge_hours = np.array([1.0, 0.0, 0.0])
+    return simulation.simulate(0, prefer_dc_charge_when_neutral=True), simulation
+
+
+class TestSplitSlot0NeutralDcPermission:
+    """rc3 neutral DC permission (#1397) in a slot 0 split at the EV charge.
+
+    A controller has one DC permission for the whole slot. The split slot
+    keeps the neutral permission only if both parts found it neutral.
+    """
+
+    def test_permission_stays_off_when_the_part_without_the_ev_stores_pv(self, config_eos):
+        # Passed half: 300 Wh PV against 250 Wh load leaves a PV surplus, so the
+        # permission is not neutral there (it would store PV the plan does not
+        # allow). The half with the EV (3.5 kWh) takes all PV, where alone it
+        # would turn the permission on.
+        result, simulation = _simulate_slot0_neutral_dc(pv_wh=600.0, load_wh=500.0)
+
+        assert simulation.ev_charge_hours[0] > 0.0
+        assert simulation.dc_charge_hours[0] == 0.0
+        assert result["Netzeinspeisung_Wh_pro_Stunde"][0] > 0.0
+        assert result["akku_soc_pro_stunde"][1] == 0.0
+
+    def test_permission_is_on_when_both_parts_are_neutral(self, config_eos):
+        # No PV: nothing to store in either part, the neutral permission is on.
+        result, simulation = _simulate_slot0_neutral_dc(pv_wh=0.0, load_wh=1000.0)
+
+        assert simulation.dc_charge_hours[0] == 1.0
+        assert result["akku_soc_pro_stunde"][1] == 0.0
+
+
 class TestChargeStart:
     def test_limit_search_moves_no_charge_before_the_charge_start(self, config_eos):
         """The cut energy goes to slots after the charge start, not to cheaper ones before it."""
