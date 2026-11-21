@@ -35,13 +35,6 @@ from akkudoktoreos.optimization.genetic.geneticparams import (
 from akkudoktoreos.optimization.genetic.geneticsolution import GeneticSolution
 from akkudoktoreos.utils.datetimeutil import to_datetime
 
-# v0.4.0rc3 has no upstream #1423 (EVs finish within a slot); see the commit message.
-RC3_WITHOUT_1423 = (
-    "v0.4.0rc3 lacks upstream #1423: an EV request above its room is lowered to the "
-    "highest charge rate that fits, so the vehicle cannot fill up exactly. OPEN "
-    "DECISION: take #1423 or keep rc3 (then adapt the expectation)."
-)
-
 DIR_TESTDATA = Path(__file__).parent / "testdata" / "genetic"
 
 HOURS = 6
@@ -725,7 +718,6 @@ def real_parameters(*, with_pv: bool = True, **ev: Any) -> GeneticOptimizationPa
     )
 
 
-@pytest.mark.xfail(strict=True, reason=RC3_WITHOUT_1423)
 def test_real_prices_charge_beyond_the_target_in_the_cheap_hours_only(
     config_eos: ConfigEOS,
 ) -> None:
@@ -788,17 +780,7 @@ def lossy_prices(cheap: float) -> list[float]:
     return prices
 
 
-@pytest.mark.parametrize(
-    ("cheap", "charges"),
-    [
-        pytest.param(
-            0.00009,
-            True,
-            marks=pytest.mark.xfail(strict=True, reason=RC3_WITHOUT_1423),
-        ),
-        (0.0001, False),
-    ],
-)
+@pytest.mark.parametrize(("cheap", "charges"), [(0.00009, True), (0.0001, False)])
 def test_value_is_per_stored_kwh_with_charging_losses(
     config_eos: ConfigEOS, cheap: float, charges: bool
 ) -> None:

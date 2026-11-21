@@ -23,13 +23,6 @@ from akkudoktoreos.optimization.genetic.geneticparams import (
 from akkudoktoreos.optimization.genetic.geneticsolution import GeneticSolution
 from akkudoktoreos.utils.datetimeutil import to_datetime
 
-# v0.4.0rc3 has no upstream #1423 (EVs finish within a slot); see the commit message.
-RC3_WITHOUT_1423 = (
-    "v0.4.0rc3 lacks upstream #1423: an EV request above its room is lowered to the "
-    "highest charge rate that fits, so the vehicle cannot fill up exactly. OPEN "
-    "DECISION: take #1423 or keep rc3 (then adapt the expectation)."
-)
-
 
 def _configure_hourly_grid(config_eos: ConfigEOS, *, start_hour: int = 0) -> None:
     config_eos.merge_settings_from_dict(
@@ -670,13 +663,7 @@ class TestEvSeedingAndShift:
             (31, 100, 3500.0, 3500.0),
             # Target above the maximum: planned against 31 %, rounded up the
             # same way; the vehicle stops charging at its maximum SoC.
-            pytest.param(
-                50,
-                31,
-                3500.0,
-                3100.0,
-                marks=pytest.mark.xfail(strict=True, reason=RC3_WITHOUT_1423),
-            ),
+            (50, 31, 3500.0, 3100.0),
         ],
     )
     def test_ev_seed_rounds_up_to_the_charge_rates(

@@ -31,13 +31,6 @@ from akkudoktoreos.optimization.genetic.geneticparams import (
 from akkudoktoreos.optimization.genetic.geneticsolution import GeneticSolution
 from akkudoktoreos.utils.datetimeutil import to_datetime
 
-# v0.4.0rc3 has no upstream #1423 (EVs finish within a slot); see the commit message.
-RC3_WITHOUT_1423 = (
-    "v0.4.0rc3 lacks upstream #1423: an EV request above its room is lowered to the "
-    "highest charge rate that fits, so the vehicle cannot fill up exactly. OPEN "
-    "DECISION: take #1423 or keep rc3 (then adapt the expectation)."
-)
-
 TIMEZONE = "Europe/Berlin"
 DAY = "2026-11-08"
 DEADLINE = f"{DAY}T04:00:00+01:00"
@@ -267,7 +260,6 @@ def test_missed_deadline_keeps_charging_to_the_target_in_the_cheap_hour(
     assert solution.result.ev_soc_per_hour[1] >= 80.0
 
 
-@pytest.mark.xfail(strict=True, reason=RC3_WITHOUT_1423)
 def test_missed_deadline_credits_the_value_until_the_end_of_the_horizon(
     night: ConfigEOS,
 ) -> None:
