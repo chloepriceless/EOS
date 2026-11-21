@@ -3166,7 +3166,9 @@ class GeneticOptimization(OptimizationBase):
         load = np.asarray(self.simulation.load_energy_array, dtype=float)
 
         def marginal_cost(slot: int) -> tuple[float, float]:
-            surplus = pv[slot] - load[slot]
+            # Slot 0 is simulated in two parts (_split_ev_slot_energy): the
+            # vehicle only sees the PV and load of the part it charges in.
+            surplus = (pv[slot] - load[slot]) * self._ev_slot_time_share(slot)
             if prefer_pv and surplus > 0.0:
                 return (float(feed_in[slot]), -float(surplus))
             return (float(prices[slot]), -float(surplus))
@@ -3214,10 +3216,16 @@ class GeneticOptimization(OptimizationBase):
             full_ac_wh = ev.max_charge_power_w * self.slot_duration_h * full_rate
 
             def fill_cost_wh(slot: int) -> float:
-                # The current slot is only charged for the rest of it; its
-                # surplus forecast stays the whole slot's.
-                slot_ac_wh = full_ac_wh * self._ev_slot_time_share(slot)
-                surplus_wh = min(max(pv[slot] - load[slot], 0.0), slot_ac_wh) if prefer_pv else 0.0
+                # The current slot is only charged for the rest of it, and only
+                # the surplus of that part can supply the vehicle (slot 0 is
+                # simulated in two parts, see _split_ev_slot_energy).
+                time_share = self._ev_slot_time_share(slot)
+                slot_ac_wh = full_ac_wh * time_share
+                surplus_wh = (
+                    min(max(pv[slot] - load[slot], 0.0) * time_share, slot_ac_wh)
+                    if prefer_pv
+                    else 0.0
+                )
                 surplus_price = max(feed_in[slot], 0.0) if curtails_negative else feed_in[slot]
                 return float(surplus_wh * surplus_price + (slot_ac_wh - surplus_wh) * prices[slot])
 

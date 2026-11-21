@@ -347,3 +347,28 @@ def test_replay_after_a_missed_deadline_charges_to_the_target_in_the_cheap_hour(
     soc_at_five, steps = replay(start_minute=4 * 60, end_minute=5 * 60, soc_percentage=75.0)
     print(f"SoC at 05:00: {soc_at_five:.2f} %, factors: {[step.factor for step in steps]}")
     assert soc_at_five >= 80.0
+
+
+# ---------------------------------------------------------------------------
+# Seed of the energy above the target: PV of slot 0 only for its rest (B4)
+# ---------------------------------------------------------------------------
+
+
+def test_value_seed_counts_only_the_pv_of_the_rest_of_slot_0(night: ConfigEOS) -> None:
+    """Run at 00:30, the vehicle at its target (80 %), energy up to 90 % worth 0.30
+    per kWh, import 0.80 everywhere, no feed-in tariff. Slot 0 has 5250 Wh PV, so
+    the half of it the vehicle charges in has 2625 Wh; a full-power half slot
+    (5250 Wh) takes the other 2625 Wh from the grid: 0.40 per stored kWh, more than
+    the value. Slot 0 is simulated in two parts (B4), so the seed must not fill it
+    either (counting the PV of the whole slot made it look free)."""
+    start_run("00:30:00")
+    parameters = night_parameters(80, soc_value_steps=[[90, 0.3]])
+    slots = len(parameters.ems.pv_forecast_wh)
+    parameters.ems.pv_forecast_wh = [5250.0] + [0.0] * (slots - 1)
+    parameters.ems.electricity_price_per_wh = [0.0008] * slots
+    optimizer = GeneticOptimization(fixed_seed=7)
+    optimizer.optimize_ems(parameters, ngen=1, individuals=10)
+
+    seed = optimizer._heuristic_ev_schedule(prefer_pv=True)
+
+    assert optimizer.ev_possible_charge_values[seed[0]] == 0.0
