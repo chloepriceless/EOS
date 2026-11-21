@@ -120,6 +120,23 @@ class TestHeldBatteryShavesTheExcess:
         assert losses == pytest.approx(0.0)
         assert grid_export == 0.0
 
+    @pytest.mark.parametrize("battery_class", [Battery, _OtherBattery])
+    def test_held_battery_below_its_reserve_keeps_its_soc(self, battery_class):
+        """Held battery at 5 % with a 10 % reserve, 9 kWh load above the 8 kW limit.
+
+        It has nothing above the reserve to shave with. The SoC must stay at
+        5 % (#1483); without it, the discharge call raised it to the reserve.
+        """
+        inverter, battery = _devices(
+            soc_percentage=5, min_soc_percentage=10, battery_class=battery_class
+        )
+
+        _, grid_import, _, _ = inverter.process_energy(0.0, 9000.0, 0)
+
+        assert battery.soc_wh == 500.0
+        assert grid_import == 9000.0
+        assert inverter.peak_shaving_ac_wh == 0.0
+
     def test_shaving_is_limited_by_the_battery_power(self):
         """16 kWh load: 8 kWh excess, but the battery delivers at most 5 kWh."""
         inverter, battery = _devices()
