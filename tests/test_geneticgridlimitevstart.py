@@ -284,6 +284,104 @@ def _ev_rates(optimizer: GeneticOptimization, genome: list[int]) -> list[float]:
 
 
 
+def _simulate_slot0_pv(limit_w: Optional[float], pv_wh: float) -> tuple[dict[str, Any], Any]:
+    """Run at half of slot 0: 4 kWh PV, no house load, empty held battery, EV at 8 kW.
+
+    The EV can charge only in the half of slot 0 still ahead (4 kWh); PV is
+    spread over the whole slot.
+    """
+    slots = 3
+    ev_options: dict[str, Any] = {"first_slot_share": 0.5}
+    battery = Battery(
+        SolarPanelBatteryParameters(
+            device_id="battery1",
+            capacity_wh=10000,
+            initial_soc_percentage=0,
+            min_soc_percentage=0,
+            max_soc_percentage=100,
+            charging_efficiency=1.0,
+            discharging_efficiency=1.0,
+            max_charge_power_w=5000,
+        ),
+        prediction_hours=slots,
+    )
+    inverter = Inverter(
+        InverterParameters(
+            device_id="inverter1",
+            max_power_wh=10000,
+            battery_id="battery1",
+            ac_to_dc_efficiency=1.0,
+            dc_to_ac_efficiency=1.0,
+            max_grid_import_power_w=limit_w,
+        ),
+        battery=battery,
+    )
+    ev = Battery(
+        ElectricVehicleParameters(
+            device_id="ev1",
+            capacity_wh=60000,
+            charging_efficiency=1.0,
+            discharging_efficiency=1.0,
+            max_charge_power_w=8000,
+            initial_soc_percentage=0,
+            min_soc_percentage=100,
+            charge_rates=[0.0, 0.25, 0.5, 0.75, 1.0],
+        ),
+        prediction_hours=slots,
+        **ev_options,
+    )
+    simulation = GeneticSimulation()
+    simulation.prepare(
+        GeneticEnergyManagementParameters(
+            pv_forecast_wh=[pv_wh, 0.0, 0.0],
+            electricity_price_per_wh=[0.0003] * slots,
+            feed_in_tariff_per_wh=0.00008,
+            price_per_wh_battery=0.0,
+            total_load=[0.0, 0.0, 0.0],
+        ),
+        optimization_hours=slots,
+        prediction_hours=slots,
+        inverter=inverter,
+        ev=ev,
+    )
+    simulation.reset()
+    simulation.ac_charge_hours = np.zeros(slots)
+    simulation.dc_charge_hours = np.zeros(slots)
+    simulation.bat_discharge_hours = np.zeros(slots)
+    simulation.ev_charge_hours = np.array([1.0, 0.0, 0.0])
+    return simulation.simulate(0), simulation
+
+
+class TestSplitSlot0WithoutLimit:
+    """The EV charges slot 0 only in the part ahead, with or without a limit.
+
+    PV of the passed part cannot supply it: slot 0 is simulated in two parts
+    whether a grid import limit is set or not, so a limit that never binds
+    changes nothing.
+    """
+
+    @pytest.mark.parametrize("pv_wh", [0.0, 4000.0])
+    def test_a_limit_that_never_binds_changes_nothing(self, config_eos, pv_wh):
+        without, _ = _simulate_slot0_pv(None, pv_wh)
+        nonbinding, _ = _simulate_slot0_pv(1e9, pv_wh)
+
+        for key in (
+            "Netzbezug_Wh_pro_Stunde",
+            "Netzeinspeisung_Wh_pro_Stunde",
+            "Verluste_Pro_Stunde",
+            "akku_soc_pro_stunde",
+            "EAuto_SoC_pro_Stunde",
+        ):
+            assert list(without[key]) == list(nonbinding[key]), key
+
+    def test_pv_of_the_passed_part_does_not_charge_the_ev(self, config_eos):
+        # 2 kWh PV fall into each half; the EV draws 4 kWh in the half ahead,
+        # so at least 2 kWh come from the grid.
+        result, _ = _simulate_slot0_pv(None, 4000.0)
+
+        assert result["Netzbezug_Wh_pro_Stunde"][0] >= 2000.0 - 1e-6
+
+
 def _simulate_slot0_neutral_dc(pv_wh: float, load_wh: float) -> tuple[dict[str, Any], Any]:
     """Run at half of slot 0, plan without DC permission, rc3 neutral DC (#1397) on.
 

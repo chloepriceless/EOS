@@ -854,13 +854,14 @@ class GeneticSimulation(PydanticBaseModel):
             ev_charge_hours_array = ev_fast.charge_array
         # A run that starts inside slot 0 may charge the EV only in the part of
         # the slot still ahead (``Battery.first_slot_share`` of the EV charge
-        # start, #1532), while load and PV fill the whole slot. The limit is a
-        # power: the EV draws its slot 0 energy in that part, so slot 0 is
-        # simulated as a part without and a part with the EV (see
-        # _split_ev_slot_energy), and the limit applies to the latter.
+        # start, #1532), while load and PV fill the whole slot. The EV draws its
+        # slot 0 energy in that part, so slot 0 is simulated as a part without
+        # and a part with the EV (see _split_ev_slot_energy), with or without a
+        # grid import limit: PV of the passed part cannot supply the EV. A limit
+        # is a power and applies to the part with the EV.
         ev_first_slot_extra = 0.0
         ev_first_slot_share = 1.0
-        if max_grid_import_wh_fast is not None and ev_fast:
+        if ev_fast:
             ev_first_slot_share = float(getattr(ev_fast, "first_slot_share", 1.0))
             if 0.0 < ev_first_slot_share < 1.0:
                 ev_first_slot_extra = 1.0 / ev_first_slot_share - 1.0
@@ -940,9 +941,9 @@ class GeneticSimulation(PydanticBaseModel):
                     soc_ev_per_hour[hour_idx] = ev_fast.current_soc_percentage()
                 ev_charge_factor = ev_charge_hours_fast[hour]
                 if ev_charge_factor > 0:
+                    consumption_without_ev = consumption
                     if ev_grid_limited_charge_factors is not None:
                         ev_slot_state = ev_fast.slot_state(hour)
-                        consumption_without_ev = consumption
                     stored_energy_ev, verluste_eauto = ev_fast.charge_energy(
                         wh=None, hour=hour, charge_factor=ev_charge_factor
                     )
